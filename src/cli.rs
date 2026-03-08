@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -23,6 +25,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Daemon(DaemonArgs),
     Inspect(InspectArgs),
     IngestOnce(IngestOnceArgs),
     SyncRepo(SyncRepoArgs),
@@ -76,8 +79,36 @@ struct SyncRepoArgs {
     no_push: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+struct DaemonArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    #[arg(long, default_value_os_t = default_spool_dir())]
+    spool_dir: PathBuf,
+
+    #[arg(long)]
+    repo: PathBuf,
+
+    #[arg(long, default_value = "origin")]
+    remote: String,
+
+    #[arg(long, default_value = "main")]
+    branch: String,
+
+    #[arg(long)]
+    no_push: bool,
+
+    #[arg(long, default_value_t = 10)]
+    interval_secs: u64,
+
+    #[arg(long)]
+    max_iterations: Option<usize>,
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Daemon(args) => daemon(args),
         Command::Inspect(args) => inspect(args),
         Command::IngestOnce(args) => ingest_once(args),
         Command::SyncRepo(args) => sync_repo(args),
@@ -112,14 +143,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
 
     println!("root: {}", args.common.root.display());
     println!("sessions: {}", sessions.len());
-    println!(
-        "changes: {}",
-        format_counts(&counts)
-            .into_iter()
-            .map(|(kind, count)| format!("{kind}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("changes: {}", format_counts_line(&counts));
 
     for (change, session) in rows.into_iter().take(args.limit) {
         println!(
@@ -134,78 +158,87 @@ fn inspect(args: InspectArgs) -> Result<()> {
 }
 
 fn ingest_once(args: IngestOnceArgs) -> Result<()> {
-    let mut state = StateStore::open(&args.common.state_db)?;
-    let previous = state.load_all()?;
-    let scanner = SessionScanner::new(args.common.root.clone());
-    let sessions = scanner.scan()?;
-    let spool = SpoolWriter::new(args.spool_dir.clone())?;
-
-    state.begin_transaction()?;
-
-    let mut counts = BTreeMap::<ChangeKind, usize>::new();
-    let mut batches_written = 0usize;
-
-    for session in &sessions {
-        let change = classify(previous.get(&session.path_key), session);
-        *counts.entry(change).or_insert(0) += 1;
-
-        if let Some(batch) = build_batch(previous.get(&session.path_key), session, change)? {
-            spool.write_batch(&batch)?;
-            batches_written += 1;
-        }
-
-        state.upsert(session)?;
-    }
-
-    state.commit()?;
+    let summary = run_ingest_once(&args.common.root, &args.common.state_db, &args.spool_dir)?;
 
     println!("root: {}", args.common.root.display());
     println!("state_db: {}", args.common.state_db.display());
     println!("spool_dir: {}", args.spool_dir.display());
-    println!("sessions: {}", sessions.len());
-    println!("batches_written: {batches_written}");
-    println!(
-        "changes: {}",
-        format_counts(&counts)
-            .into_iter()
-            .map(|(kind, count)| format!("{kind}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("sessions: {}", summary.sessions);
+    println!("batches_written: {}", summary.batches_written);
+    println!("changes: {}", format_counts_line(&summary.counts));
 
     Ok(())
 }
 
 fn sync_repo(args: SyncRepoArgs) -> Result<()> {
-    let spool = SpoolWriter::new(args.spool_dir.clone())?;
-    let pending = spool.load_pending_batches()?;
-
-    if pending.is_empty() {
-        println!("spool_dir: {}", args.spool_dir.display());
-        println!("pending_batches: 0");
-        return Ok(());
-    }
-
-    let repo = RepoSync::new(
-        args.repo.clone(),
+    let summary = run_sync_repo(
+        &args.spool_dir,
+        &args.repo,
         SyncOptions {
             remote: args.remote,
             branch: args.branch,
             push: !args.no_push,
         },
     )?;
-    let summary = repo.import_batches(&pending)?;
-
-    for batch in &pending {
-        spool.mark_processed(batch)?;
-    }
 
     println!("repo: {}", args.repo.display());
     println!("spool_dir: {}", args.spool_dir.display());
-    println!("pending_batches: {}", pending.len());
+    println!("pending_batches: {}", summary.pending_batches);
     println!("imported_files: {}", summary.imported_files);
     println!("created_commit: {}", summary.created_commit);
     println!("pushed: {}", summary.pushed);
+
+    Ok(())
+}
+
+fn daemon(args: DaemonArgs) -> Result<()> {
+    let mut iteration = 0usize;
+
+    loop {
+        iteration += 1;
+        tracing::info!("starting daemon iteration {}", iteration);
+
+        match run_ingest_once(&args.common.root, &args.common.state_db, &args.spool_dir) {
+            Ok(ingest) => tracing::info!(
+                iteration,
+                sessions = ingest.sessions,
+                batches_written = ingest.batches_written,
+                changes = %format_counts_line(&ingest.counts),
+                "ingest cycle complete"
+            ),
+            Err(error) => tracing::error!(iteration, error = %error, "ingest cycle failed"),
+        }
+
+        match run_sync_repo(
+            &args.spool_dir,
+            &args.repo,
+            SyncOptions {
+                remote: args.remote.clone(),
+                branch: args.branch.clone(),
+                push: !args.no_push,
+            },
+        ) {
+            Ok(sync) => tracing::info!(
+                iteration,
+                pending_batches = sync.pending_batches,
+                imported_files = sync.imported_files,
+                created_commit = sync.created_commit,
+                pushed = sync.pushed,
+                "sync cycle complete"
+            ),
+            Err(error) => tracing::error!(iteration, error = %error, "sync cycle failed"),
+        }
+
+        if args
+            .max_iterations
+            .is_some_and(|max_iterations| iteration >= max_iterations)
+        {
+            tracing::info!(iteration, "daemon loop complete");
+            break;
+        }
+
+        thread::sleep(Duration::from_secs(args.interval_secs));
+    }
 
     Ok(())
 }
@@ -249,6 +282,67 @@ fn load_state_if_present(path: &Path) -> Result<BTreeMap<String, StoredSession>>
     StateStore::open(path)?.load_all()
 }
 
+fn run_ingest_once(root: &Path, state_db: &Path, spool_dir: &Path) -> Result<IngestSummary> {
+    let mut state = StateStore::open(state_db)?;
+    let previous = state.load_all()?;
+    let scanner = SessionScanner::new(root.to_path_buf());
+    let sessions = scanner.scan()?;
+    let spool = SpoolWriter::new(spool_dir.to_path_buf())?;
+
+    state.begin_transaction()?;
+
+    let mut counts = BTreeMap::<ChangeKind, usize>::new();
+    let mut batches_written = 0usize;
+
+    for session in &sessions {
+        let change = classify(previous.get(&session.path_key), session);
+        *counts.entry(change).or_insert(0) += 1;
+
+        if let Some(batch) = build_batch(previous.get(&session.path_key), session, change)? {
+            spool.write_batch(&batch)?;
+            batches_written += 1;
+        }
+
+        state.upsert(session)?;
+    }
+
+    state.commit()?;
+
+    Ok(IngestSummary {
+        sessions: sessions.len(),
+        batches_written,
+        counts,
+    })
+}
+
+fn run_sync_repo(spool_dir: &Path, repo: &Path, options: SyncOptions) -> Result<SyncRunSummary> {
+    let spool = SpoolWriter::new(spool_dir.to_path_buf())?;
+    let pending = spool.load_pending_batches()?;
+
+    if pending.is_empty() {
+        return Ok(SyncRunSummary {
+            pending_batches: 0,
+            imported_files: 0,
+            created_commit: false,
+            pushed: false,
+        });
+    }
+
+    let repo = RepoSync::new(repo.to_path_buf(), options)?;
+    let summary = repo.import_batches(&pending)?;
+
+    for batch in &pending {
+        spool.mark_processed(batch)?;
+    }
+
+    Ok(SyncRunSummary {
+        pending_batches: pending.len(),
+        imported_files: summary.imported_files,
+        created_commit: summary.created_commit,
+        pushed: summary.pushed,
+    })
+}
+
 fn default_sessions_root() -> PathBuf {
     home_dir()
         .map(|path| path.join(".codex").join("sessions"))
@@ -277,4 +371,25 @@ fn format_counts(counts: &BTreeMap<ChangeKind, usize>) -> Vec<(ChangeKind, usize
     .into_iter()
     .map(|kind| (kind, counts.get(&kind).copied().unwrap_or(0)))
     .collect()
+}
+
+fn format_counts_line(counts: &BTreeMap<ChangeKind, usize>) -> String {
+    format_counts(counts)
+        .into_iter()
+        .map(|(kind, count)| format!("{kind}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+struct IngestSummary {
+    sessions: usize,
+    batches_written: usize,
+    counts: BTreeMap<ChangeKind, usize>,
+}
+
+struct SyncRunSummary {
+    pending_batches: usize,
+    imported_files: usize,
+    created_commit: bool,
+    pushed: bool,
 }
