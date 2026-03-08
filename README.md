@@ -91,8 +91,13 @@ cargo run -- ingest-once
 By default this uses:
 
 - session root: `~/.codex/sessions`
-- state DB: `var/state.sqlite3`
-- spool dir: `var/spool`
+- state DB: `$XDG_STATE_HOME/codex-session-sync/state.sqlite3`
+- spool dir: `$XDG_STATE_HOME/codex-session-sync/spool`
+
+If `XDG_STATE_HOME` is not set, the fallback is:
+
+- `~/.local/state/codex-session-sync/state.sqlite3`
+- `~/.local/state/codex-session-sync/spool`
 
 ### Sync Once
 
@@ -136,11 +141,13 @@ The daemon currently polls rather than using filesystem notifications.
 
 ## Runtime Files
 
-Runtime state lives under `var/` and is ignored by Git:
+Runtime state lives under the user state directory:
 
-- `var/state.sqlite3`
-- `var/spool/pending/`
-- `var/spool/processed/`
+- `$XDG_STATE_HOME/codex-session-sync/state.sqlite3`
+- `$XDG_STATE_HOME/codex-session-sync/spool/pending/`
+- `$XDG_STATE_HOME/codex-session-sync/spool/processed/`
+
+If `XDG_STATE_HOME` is not set, this falls back to `~/.local/state`.
 
 The sync repo itself gets a local coordination lock while a sync is in progress:
 
@@ -162,6 +169,47 @@ A typical flow is:
 4. Let other machines run the same daemon against their own clones of the same remote.
 
 Because the imported files are immutable batch files, concurrent clones mostly add different files instead of editing the same file.
+
+## NixOS User Service
+
+The flake now exports a NixOS module at `nixosModules.default`.
+
+It is intended for `systemd.user.services`, not a system-wide daemon. The service runs while the target user is logged in, which matches the expected Codex usage model.
+
+Example NixOS configuration:
+
+```nix
+{
+  inputs.codex-session-sync.url = "path:/path/to/codex-session-sync";
+
+  outputs = { self, nixpkgs, codex-session-sync, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        codex-session-sync.nixosModules.default
+        ({ ... }: {
+          services.codex-session-sync = {
+            enable = true;
+            user = "warren";
+            repoPath = "%h/.local/share/codex-session-sync/repo";
+            remote = "origin";
+            branch = "main";
+            intervalSeconds = 10;
+            push = true;
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+Important notes:
+
+- `user` should be set explicitly. The module uses `ConditionUser=` so the unit only runs for that user's systemd user manager.
+- `repoPath` must point to an existing writable Git clone of the central repository.
+- The module passes explicit user-local paths for the session root, state DB, and spool directory.
+- The package output wraps `git`, so the service does not depend on an external `git` being present in the user shell.
 
 ## Status
 

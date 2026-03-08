@@ -8,7 +8,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+    (flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
@@ -26,9 +26,13 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
           nativeCheckInputs = [ pkgs.git ];
           buildInputs = [ pkgs.sqlite ];
+          postFixup = ''
+            wrapProgram "$out/bin/codex-session-sync" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+          '';
         };
       in
       {
@@ -56,5 +60,8 @@
         };
 
         formatter = pkgs.nixpkgs-fmt;
-      });
+      })
+    ) // {
+      nixosModules.default = import ./nix/nixos-module.nix { inherit self; };
+    };
 }

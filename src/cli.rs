@@ -356,15 +356,26 @@ fn default_sessions_root() -> PathBuf {
 }
 
 fn default_state_db() -> PathBuf {
-    PathBuf::from("var").join("state.sqlite3")
+    default_state_home()
+        .join("codex-session-sync")
+        .join("state.sqlite3")
 }
 
 fn default_spool_dir() -> PathBuf {
-    PathBuf::from("var").join("spool")
+    default_state_home()
+        .join("codex-session-sync")
+        .join("spool")
 }
 
 fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
+}
+
+fn default_state_home() -> PathBuf {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|path| path.join(".local").join("state")))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn format_counts(counts: &BTreeMap<ChangeKind, usize>) -> Vec<(ChangeKind, usize)> {
