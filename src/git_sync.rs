@@ -37,6 +37,17 @@ impl RepoSync {
     }
 
     pub fn import_batches(&self, batches: &[StoredBatch]) -> Result<SyncSummary> {
+        self.import_batches_with_after_pull(batches, || Ok(()))
+    }
+
+    fn import_batches_with_after_pull<F>(
+        &self,
+        batches: &[StoredBatch],
+        after_pull: F,
+    ) -> Result<SyncSummary>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let Some(_lock) = RepoLock::acquire(&self.repo)? else {
             return Ok(SyncSummary {
                 skipped_due_to_lock: true,
@@ -49,6 +60,8 @@ impl RepoSync {
         if self.options.push && remote_exists(&self.repo, &self.options.remote)? {
             pull_rebase(&self.repo, &self.options.remote, &self.options.branch)?;
         }
+
+        after_pull()?;
 
         let mut imported_files = 0usize;
         for batch in batches {
@@ -302,12 +315,14 @@ fn write_lock_metadata(lock_dir: &Path) -> Result<()> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{RepoSync, SyncOptions};
+    use super::{RepoSync, SyncOptions, SyncSummary};
     use crate::scan::ChangeKind;
     use crate::spool::{SpoolBatch, StoredBatch};
 
@@ -415,13 +430,166 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn concurrent_clones_converge_for_same_session() -> Result<()> {
+        let remote_dir = temp_dir("remote");
+        let seed_dir = temp_dir("seed");
+        let clone_a = temp_dir("clone-a");
+        let clone_b = temp_dir("clone-b");
+        let verify_dir = temp_dir("verify");
+
+        fs::create_dir_all(&remote_dir)?;
+        fs::create_dir_all(&seed_dir)?;
+        git_init_bare(&remote_dir)?;
+        git_init(&seed_dir)?;
+        git(
+            seed_dir.as_path(),
+            ["commit", "--allow-empty", "-m", "Initial commit"],
+        )?;
+        git(seed_dir.as_path(), ["branch", "-M", "main"])?;
+        git(
+            seed_dir.as_path(),
+            ["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        )?;
+        git(seed_dir.as_path(), ["push", "-u", "origin", "main"])?;
+
+        git_clone(&remote_dir, &clone_a)?;
+        git_clone(&remote_dir, &clone_b)?;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let batch_a = test_batch("batch-a", "session-shared", json!({"writer": "A"}));
+        let batch_b = test_batch("batch-b", "session-shared", json!({"writer": "B"}));
+
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+        let thread_a = thread::spawn(move || -> Result<SyncSummary> {
+            let sync = RepoSync::new(
+                clone_a,
+                SyncOptions {
+                    remote: "origin".to_string(),
+                    branch: "main".to_string(),
+                    push: true,
+                },
+            )?;
+            sync.import_batches_with_after_pull(&[batch_a], || {
+                barrier_a.wait();
+                Ok(())
+            })
+        });
+        let thread_b = thread::spawn(move || -> Result<SyncSummary> {
+            let sync = RepoSync::new(
+                clone_b,
+                SyncOptions {
+                    remote: "origin".to_string(),
+                    branch: "main".to_string(),
+                    push: true,
+                },
+            )?;
+            sync.import_batches_with_after_pull(&[batch_b], || {
+                barrier_b.wait();
+                Ok(())
+            })
+        });
+
+        let summary_a = thread_a.join().expect("thread A panicked")?;
+        let summary_b = thread_b.join().expect("thread B panicked")?;
+
+        assert_eq!(summary_a.imported_files, 1);
+        assert_eq!(summary_b.imported_files, 1);
+        assert!(summary_a.created_commit);
+        assert!(summary_b.created_commit);
+        assert!(summary_a.pushed);
+        assert!(summary_b.pushed);
+
+        git_clone(&remote_dir, &verify_dir)?;
+        assert!(
+            verify_dir
+                .join("sessions")
+                .join("session-shared")
+                .join("batches")
+                .join("batch-a.json")
+                .exists()
+        );
+        assert!(
+            verify_dir
+                .join("sessions")
+                .join("session-shared")
+                .join("batches")
+                .join("batch-b.json")
+                .exists()
+        );
+
+        fs::remove_dir_all(remote_dir)?;
+        fs::remove_dir_all(seed_dir)?;
+        fs::remove_dir_all(verify_dir)?;
+        Ok(())
+    }
+
     fn git_init(path: &Path) -> Result<()> {
+        git(path, ["init"])?;
+        Ok(())
+    }
+
+    fn git_init_bare(path: &Path) -> Result<()> {
+        git(path, ["init", "--bare"])?;
+        Ok(())
+    }
+
+    fn git_clone(remote: &Path, target: &Path) -> Result<()> {
+        let target_parent = target.parent().expect("clone target must have parent");
+        fs::create_dir_all(target_parent)?;
+        git(
+            target_parent,
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                target.file_name().unwrap().to_str().unwrap(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn git<I, S>(path: &Path, args: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let status = std::process::Command::new("git")
             .current_dir(path)
-            .arg("init")
+            .args([
+                "-c",
+                "user.name=codex-session-sync-tests",
+                "-c",
+                "user.email=codex-session-sync-tests@local",
+            ])
+            .args(args)
             .status()?;
-        anyhow::ensure!(status.success(), "git init failed");
+        anyhow::ensure!(status.success(), "git command failed");
         Ok(())
+    }
+
+    fn test_batch(batch_id: &str, session_id: &str, payload: serde_json::Value) -> StoredBatch {
+        StoredBatch {
+            path: PathBuf::from(format!("{batch_id}.json")),
+            batch: SpoolBatch {
+                schema_version: 1,
+                batch_id: batch_id.to_string(),
+                ingested_at_unix_ms: 1,
+                source_path: format!("/tmp/{session_id}.jsonl"),
+                source_session_id: Some(session_id.to_string()),
+                source_device: 1,
+                source_inode: 2,
+                source_size: 3,
+                source_sha256: "abc".to_string(),
+                change_kind: ChangeKind::Appended,
+                start_line: 10,
+                end_line: 11,
+                record_count: 1,
+                records: vec![payload],
+            },
+        }
     }
 
     fn temp_dir(label: &str) -> PathBuf {
