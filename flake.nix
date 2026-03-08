@@ -17,8 +17,29 @@
         rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [ "clippy" "rust-src" "rustfmt" ];
         };
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
+        package = rustPlatform.buildRustPackage {
+          pname = "codex-session-sync";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeCheckInputs = [ pkgs.git ];
+          buildInputs = [ pkgs.sqlite ];
+        };
       in
       {
+        packages.default = package;
+
+        apps.default = flake-utils.lib.mkApp {
+          drv = package;
+        };
+
+        checks.default = package;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain

@@ -250,6 +250,12 @@ where
 {
     let output = Command::new("git")
         .current_dir(repo)
+        .args([
+            "-c",
+            "user.name=codex-session-sync",
+            "-c",
+            "user.email=codex-session-sync@local",
+        ])
         .args(args)
         .output()
         .with_context(|| format!("failed to run git in {}", repo.display()))?;
