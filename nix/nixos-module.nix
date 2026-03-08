@@ -11,18 +11,14 @@ let
   execArgs = [
     "${package}/bin/codex-session-sync"
     "daemon"
+    "--config"
+    cfg.configPath
     "--root"
     cfg.sessionsRoot
     "--state-db"
     cfg.stateDb
     "--spool-dir"
     cfg.spoolDir
-    "--repo"
-    cfg.repoPath
-    "--remote"
-    cfg.remote
-    "--branch"
-    cfg.branch
     "--interval-secs"
     (toString cfg.intervalSeconds)
   ] ++ lib.optional (!cfg.push) "--no-push";
@@ -38,10 +34,10 @@ in
       description = "Package providing the codex-session-sync binary.";
     };
 
-    user = lib.mkOption {
+    configPath = lib.mkOption {
       type = lib.types.str;
-      example = "alice";
-      description = "User account whose systemd user manager should run the sync service.";
+      default = "%h/.codex/sync.toml";
+      description = "Path to the sync.toml file, interpreted by systemd with user specifiers.";
     };
 
     sessionsRoot = lib.mkOption {
@@ -60,24 +56,6 @@ in
       type = lib.types.str;
       default = "%h/.local/state/codex-session-sync/spool";
       description = "Path to the local spool directory, interpreted by systemd with user specifiers.";
-    };
-
-    repoPath = lib.mkOption {
-      type = lib.types.str;
-      default = "%h/.local/share/codex-session-sync/repo";
-      description = "Path to the writable local clone of the central sync repository, interpreted by systemd with user specifiers.";
-    };
-
-    remote = lib.mkOption {
-      type = lib.types.str;
-      default = "origin";
-      description = "Git remote name used for pull/push.";
-    };
-
-    branch = lib.mkOption {
-      type = lib.types.str;
-      default = "main";
-      description = "Git branch used for pull/push.";
     };
 
     intervalSeconds = lib.mkOption {
@@ -110,9 +88,6 @@ in
       description = "Sync Codex sessions into a central Git repository";
       wantedBy = [ "default.target" ];
       after = [ "default.target" ];
-      unitConfig = {
-        ConditionUser = cfg.user;
-      };
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " (map lib.escapeShellArg execArgs);
         Restart = "on-failure";

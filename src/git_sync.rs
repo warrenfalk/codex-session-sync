@@ -19,6 +19,7 @@ pub struct RepoSync {
 pub struct SyncOptions {
     pub remote: String,
     pub branch: String,
+    pub remote_url: String,
     pub push: bool,
 }
 
@@ -32,7 +33,7 @@ pub struct SyncSummary {
 
 impl RepoSync {
     pub fn new(repo: PathBuf, options: SyncOptions) -> Result<Self> {
-        ensure_repo(&repo)?;
+        ensure_repo_or_clone(&repo, &options.remote_url, &options.branch)?;
         Ok(Self { repo, options })
     }
 
@@ -125,10 +126,38 @@ impl RepoSync {
     }
 }
 
-fn ensure_repo(path: &Path) -> Result<()> {
-    if !path.join(".git").exists() {
-        bail!("{} is not a git repository", path.display());
+fn ensure_repo_or_clone(path: &Path, remote_url: &str, branch: &str) -> Result<()> {
+    if path.join(".git").exists() {
+        return Ok(());
     }
+
+    if path.exists() {
+        let mut entries =
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
+        if entries.next().is_some() {
+            bail!(
+                "{} exists but is not a git repository and is not empty",
+                path.display()
+            );
+        }
+    } else if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let clone_parent = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let clone_target = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid repo path {}", path.display()))?;
+
+    git(
+        &clone_parent,
+        ["clone", "--branch", branch, remote_url, clone_target],
+    )?;
     Ok(())
 }
 
@@ -363,6 +392,7 @@ mod tests {
             SyncOptions {
                 remote: "origin".to_string(),
                 branch: "main".to_string(),
+                remote_url: repo_dir.display().to_string(),
                 push: false,
             },
         )?;
@@ -416,6 +446,7 @@ mod tests {
             SyncOptions {
                 remote: "origin".to_string(),
                 branch: "main".to_string(),
+                remote_url: repo_dir.display().to_string(),
                 push: false,
             },
         )?;
@@ -465,6 +496,8 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let batch_a = test_batch("batch-a", "session-shared", json!({"writer": "A"}));
         let batch_b = test_batch("batch-b", "session-shared", json!({"writer": "B"}));
+        let remote_dir_a = remote_dir.clone();
+        let remote_dir_b = remote_dir.clone();
 
         let barrier_a = Arc::clone(&barrier);
         let barrier_b = Arc::clone(&barrier);
@@ -474,6 +507,7 @@ mod tests {
                 SyncOptions {
                     remote: "origin".to_string(),
                     branch: "main".to_string(),
+                    remote_url: remote_dir_a.display().to_string(),
                     push: true,
                 },
             )?;
@@ -488,6 +522,7 @@ mod tests {
                 SyncOptions {
                     remote: "origin".to_string(),
                     branch: "main".to_string(),
+                    remote_url: remote_dir_b.display().to_string(),
                     push: true,
                 },
             )?;
@@ -554,6 +589,46 @@ mod tests {
                 target.file_name().unwrap().to_str().unwrap(),
             ],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bootstraps_missing_repo_by_cloning_remote() -> Result<()> {
+        let remote_dir = temp_dir("bootstrap-remote");
+        let seed_dir = temp_dir("bootstrap-seed");
+        let target_dir = temp_dir("bootstrap-target");
+
+        fs::create_dir_all(&remote_dir)?;
+        fs::create_dir_all(&seed_dir)?;
+        git_init_bare(&remote_dir)?;
+        git_init(&seed_dir)?;
+        git(
+            seed_dir.as_path(),
+            ["commit", "--allow-empty", "-m", "Initial commit"],
+        )?;
+        git(seed_dir.as_path(), ["branch", "-M", "main"])?;
+        git(
+            seed_dir.as_path(),
+            ["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        )?;
+        git(seed_dir.as_path(), ["push", "-u", "origin", "main"])?;
+        fs::remove_dir_all(&target_dir).ok();
+
+        let _sync = RepoSync::new(
+            target_dir.clone(),
+            SyncOptions {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+                remote_url: remote_dir.display().to_string(),
+                push: false,
+            },
+        )?;
+
+        assert!(target_dir.join(".git").exists());
+
+        fs::remove_dir_all(remote_dir)?;
+        fs::remove_dir_all(seed_dir)?;
+        fs::remove_dir_all(target_dir)?;
         Ok(())
     }
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+use crate::config::{ResolvedSyncConfig, default_codex_dir, default_config_path, load_sync_config};
 use crate::git_sync::{RepoSync, SyncOptions};
 use crate::scan::{ChangeKind, ScannedSession, SessionScanner};
 use crate::spool::{SpoolBatch, SpoolWriter};
@@ -67,13 +68,19 @@ struct SyncRepoArgs {
     spool_dir: PathBuf,
 
     #[arg(long)]
-    repo: PathBuf,
+    repo: Option<PathBuf>,
+
+    #[arg(long, default_value_os_t = default_config_path())]
+    config: PathBuf,
+
+    #[arg(long)]
+    remote_url: Option<String>,
 
     #[arg(long, default_value = "origin")]
     remote: String,
 
-    #[arg(long, default_value = "main")]
-    branch: String,
+    #[arg(long)]
+    branch: Option<String>,
 
     #[arg(long)]
     no_push: bool,
@@ -88,13 +95,19 @@ struct DaemonArgs {
     spool_dir: PathBuf,
 
     #[arg(long)]
-    repo: PathBuf,
+    repo: Option<PathBuf>,
+
+    #[arg(long, default_value_os_t = default_config_path())]
+    config: PathBuf,
+
+    #[arg(long)]
+    remote_url: Option<String>,
 
     #[arg(long, default_value = "origin")]
     remote: String,
 
-    #[arg(long, default_value = "main")]
-    branch: String,
+    #[arg(long)]
+    branch: Option<String>,
 
     #[arg(long)]
     no_push: bool,
@@ -171,17 +184,28 @@ fn ingest_once(args: IngestOnceArgs) -> Result<()> {
 }
 
 fn sync_repo(args: SyncRepoArgs) -> Result<()> {
+    let Some(sync_config) =
+        resolve_sync_config(&args.config, args.repo, args.remote_url, args.branch, true)?
+    else {
+        println!("config: {}", args.config.display());
+        println!("skipped: true");
+        println!("reason: missing_config");
+        return Ok(());
+    };
+
     let summary = run_sync_repo(
         &args.spool_dir,
-        &args.repo,
+        &sync_config,
         SyncOptions {
             remote: args.remote,
-            branch: args.branch,
+            branch: sync_config.branch.clone(),
+            remote_url: sync_config.remote_url.clone(),
             push: !args.no_push,
         },
     )?;
 
-    println!("repo: {}", args.repo.display());
+    println!("config: {}", sync_config.path.display());
+    println!("repo: {}", sync_config.repo_path.display());
     println!("spool_dir: {}", args.spool_dir.display());
     println!("pending_batches: {}", summary.pending_batches);
     println!("imported_files: {}", summary.imported_files);
@@ -193,6 +217,13 @@ fn sync_repo(args: SyncRepoArgs) -> Result<()> {
 }
 
 fn daemon(args: DaemonArgs) -> Result<()> {
+    let Some(sync_config) =
+        resolve_sync_config(&args.config, args.repo, args.remote_url, args.branch, false)?
+    else {
+        tracing::info!(config = %args.config.display(), "sync config not present; exiting");
+        return Ok(());
+    };
+
     let mut iteration = 0usize;
 
     loop {
@@ -212,10 +243,11 @@ fn daemon(args: DaemonArgs) -> Result<()> {
 
         match run_sync_repo(
             &args.spool_dir,
-            &args.repo,
+            &sync_config,
             SyncOptions {
                 remote: args.remote.clone(),
-                branch: args.branch.clone(),
+                branch: sync_config.branch.clone(),
+                remote_url: sync_config.remote_url.clone(),
                 push: !args.no_push,
             },
         ) {
@@ -317,7 +349,11 @@ fn run_ingest_once(root: &Path, state_db: &Path, spool_dir: &Path) -> Result<Ing
     })
 }
 
-fn run_sync_repo(spool_dir: &Path, repo: &Path, options: SyncOptions) -> Result<SyncRunSummary> {
+fn run_sync_repo(
+    spool_dir: &Path,
+    sync_config: &ResolvedSyncConfig,
+    options: SyncOptions,
+) -> Result<SyncRunSummary> {
     let spool = SpoolWriter::new(spool_dir.to_path_buf())?;
     let pending = spool.load_pending_batches()?;
 
@@ -331,7 +367,7 @@ fn run_sync_repo(spool_dir: &Path, repo: &Path, options: SyncOptions) -> Result<
         });
     }
 
-    let repo = RepoSync::new(repo.to_path_buf(), options)?;
+    let repo = RepoSync::new(sync_config.repo_path.clone(), options)?;
     let summary = repo.import_batches(&pending)?;
 
     if !summary.skipped_due_to_lock {
@@ -350,9 +386,7 @@ fn run_sync_repo(spool_dir: &Path, repo: &Path, options: SyncOptions) -> Result<
 }
 
 fn default_sessions_root() -> PathBuf {
-    home_dir()
-        .map(|path| path.join(".codex").join("sessions"))
-        .unwrap_or_else(|| PathBuf::from(".codex/sessions"))
+    default_codex_dir().join("sessions")
 }
 
 fn default_state_db() -> PathBuf {
@@ -376,6 +410,58 @@ fn default_state_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|path| path.join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn resolve_sync_config(
+    config_path: &Path,
+    repo_override: Option<PathBuf>,
+    remote_url_override: Option<String>,
+    branch_override: Option<String>,
+    require_config: bool,
+) -> Result<Option<ResolvedSyncConfig>> {
+    let file_config = load_sync_config(config_path)?;
+    if file_config.is_none()
+        && remote_url_override.is_none()
+        && repo_override.is_none()
+        && !require_config
+    {
+        return Ok(None);
+    }
+
+    let mut config = match file_config {
+        Some(config) => config,
+        None => {
+            if require_config || remote_url_override.is_some() || repo_override.is_some() {
+                ResolvedSyncConfig {
+                    path: config_path.to_path_buf(),
+                    remote_url: String::new(),
+                    branch: "main".to_string(),
+                    repo_path: default_codex_dir().join("session-sync-repo"),
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+
+    if let Some(repo_override) = repo_override {
+        config.repo_path = repo_override;
+    }
+    if let Some(remote_url_override) = remote_url_override {
+        config.remote_url = remote_url_override;
+    }
+    if let Some(branch_override) = branch_override {
+        config.branch = branch_override;
+    }
+
+    if config.remote_url.is_empty() {
+        anyhow::bail!(
+            "no remote_url configured; expected it in {} or via --remote-url",
+            config.path.display()
+        );
+    }
+
+    Ok(Some(config))
 }
 
 fn format_counts(counts: &BTreeMap<ChangeKind, usize>) -> Vec<(ChangeKind, usize)> {

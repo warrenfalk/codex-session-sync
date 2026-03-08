@@ -6,6 +6,30 @@ The local Codex client writes JSONL session files under `~/.codex/sessions`. Thi
 
 The current implementation is CLI-first. It supports one-shot inspection and ingestion, one-shot sync into a Git repo, and a polling daemon loop.
 
+## Sync Configuration
+
+Sync configuration lives in:
+
+```text
+~/.codex/sync.toml
+```
+
+Current fields:
+
+```toml
+remote_url = "git@github.com:example/codex-session-sync.git"
+branch = "main" # optional, defaults to "main"
+repo_path = "/home/alice/.codex/session-sync-repo" # optional
+```
+
+Notes:
+
+- `remote_url` is required for syncing.
+- `branch` is optional and defaults to `main`.
+- `repo_path` is optional.
+- if `repo_path` is omitted, the local clone defaults to `~/.codex/session-sync-repo`
+- if that local repo path does not exist yet, the sync code will automatically clone `remote_url` into it
+
 ## Design
 
 The sync flow has four stages:
@@ -101,19 +125,27 @@ If `XDG_STATE_HOME` is not set, the fallback is:
 
 ### Sync Once
 
-Import pending spool batches into a separate Git repo and commit them there:
+Import pending spool batches into the configured Git repo and commit them there:
+
+```bash
+cargo run -- sync-repo
+```
+
+You can still override the configured repo path explicitly:
 
 ```bash
 cargo run -- sync-repo --repo /path/to/central-repo
 ```
 
-If you want to skip pushing and only create a local commit in that repo:
+If you want to skip pushing and only create a local commit in the target repo:
 
 ```bash
-cargo run -- sync-repo --repo /path/to/central-repo --no-push
+cargo run -- sync-repo --no-push
 ```
 
-The sync target must already be a Git repository. If the repo has an `origin` remote and you do not pass `--no-push`, the tool will:
+If the configured local repo path does not exist yet, the tool will clone `remote_url` into it automatically.
+
+If the repo has an `origin` remote and you do not pass `--no-push`, the tool will:
 
 1. `pull --rebase`
 2. import immutable batch files
@@ -126,18 +158,20 @@ The sync target must already be a Git repository. If the repo has an `origin` re
 Run the polling daemon loop:
 
 ```bash
-cargo run -- daemon --repo /path/to/central-repo
+cargo run -- daemon
 ```
 
 Useful flags:
 
 ```bash
-cargo run -- daemon --repo /path/to/central-repo --interval-secs 10
-cargo run -- daemon --repo /path/to/central-repo --no-push
-cargo run -- daemon --repo /path/to/central-repo --max-iterations 1
+cargo run -- daemon --interval-secs 10
+cargo run -- daemon --no-push
+cargo run -- daemon --max-iterations 1
+cargo run -- daemon --config ~/.codex/sync.toml
 ```
 
 The daemon currently polls rather than using filesystem notifications.
+If the config file does not exist, the daemon exits successfully without doing any work.
 
 ## Runtime Files
 
@@ -159,14 +193,15 @@ If another process is already syncing the same checkout, the second process skip
 
 ## Recommended Usage
 
-Use a dedicated clone of a private repository as the central store. Do not point the tool at the live Codex session directory as a Git working tree.
+Use a private repository as the central store. Do not point the tool at the live Codex session directory as a Git working tree.
 
 A typical flow is:
 
 1. Create a private remote repo.
-2. Clone it to a local path that this tool will use as the sync target.
-3. Run the daemon against that local clone.
-4. Let other machines run the same daemon against their own clones of the same remote.
+2. Create `~/.codex/sync.toml` with its `remote_url`.
+3. Optionally set `repo_path`; otherwise the tool will use `~/.codex/session-sync-repo`.
+4. Run the daemon.
+5. Let other machines run the same daemon with their own `~/.codex/sync.toml`.
 
 Because the imported files are immutable batch files, concurrent clones mostly add different files instead of editing the same file.
 
@@ -174,7 +209,7 @@ Because the imported files are immutable batch files, concurrent clones mostly a
 
 The flake now exports a NixOS module at `nixosModules.default`.
 
-It is intended for `systemd.user.services`, not a system-wide daemon. The service runs while the target user is logged in, which matches the expected Codex usage model.
+It is intended for `systemd.user.services`, not a system-wide daemon. The service runs while a user is logged in, which matches the expected Codex usage model.
 
 Example NixOS configuration:
 
@@ -190,10 +225,6 @@ Example NixOS configuration:
         ({ ... }: {
           services.codex-session-sync = {
             enable = true;
-            user = "warren";
-            repoPath = "%h/.local/share/codex-session-sync/repo";
-            remote = "origin";
-            branch = "main";
             intervalSeconds = 10;
             push = true;
           };
@@ -206,9 +237,10 @@ Example NixOS configuration:
 
 Important notes:
 
-- `user` should be set explicitly. The module uses `ConditionUser=` so the unit only runs for that user's systemd user manager.
-- `repoPath` must point to an existing writable Git clone of the central repository.
-- The module passes explicit user-local paths for the session root, state DB, and spool directory.
+- The user service is installed for all users.
+- A user who does not have `~/.codex/sync.toml` will simply no-op and exit successfully.
+- A user who does have `~/.codex/sync.toml` can be bootstrapped automatically because the local repo clone is created from `remote_url` if missing.
+- The module passes explicit user-local paths for the config file, session root, state DB, and spool directory.
 - The package output wraps `git`, so the service does not depend on an external `git` being present in the user shell.
 
 ## Status
