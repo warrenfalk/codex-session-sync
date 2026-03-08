@@ -30,6 +30,32 @@ Notes:
 - if `repo_path` is omitted, the local clone defaults to `~/.codex/session-sync-repo`
 - if that local repo path does not exist yet, the sync code will automatically clone `remote_url` into it
 
+If the user service was already installed before `~/.codex/sync.toml` existed, it may have started once and then exited cleanly. After creating the config file, start or restart the user service:
+
+```bash
+systemctl --user restart codex-session-sync.service
+```
+
+If it was not running yet, `start` is also fine:
+
+```bash
+systemctl --user start codex-session-sync.service
+```
+
+To verify that it is working:
+
+```bash
+systemctl --user status codex-session-sync.service
+journalctl --user -u codex-session-sync.service -f
+```
+
+Useful things to check on first run:
+
+- the service stays active instead of exiting immediately
+- `~/.codex/session-sync-repo` (or your configured `repo_path`) gets cloned if it did not already exist
+- `~/.local/state/codex-session-sync/` or `$XDG_STATE_HOME/codex-session-sync/` starts receiving state and spool files
+- the journal shows successful ingest and sync cycles
+
 ## Design
 
 The sync flow has four stages:
