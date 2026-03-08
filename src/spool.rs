@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -11,32 +11,45 @@ use crate::scan::{ChangeKind, ScannedSession};
 
 pub struct SpoolWriter {
     pending_dir: PathBuf,
+    processed_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpoolBatch {
-    schema_version: u32,
-    batch_id: String,
-    ingested_at_unix_ms: u128,
-    source_path: String,
-    source_session_id: Option<String>,
-    source_device: u64,
-    source_inode: u64,
-    source_size: u64,
-    source_sha256: String,
-    change_kind: ChangeKind,
-    start_line: usize,
-    end_line: usize,
-    record_count: usize,
-    records: Vec<Value>,
+    pub schema_version: u32,
+    pub batch_id: String,
+    pub ingested_at_unix_ms: u128,
+    pub source_path: String,
+    pub source_session_id: Option<String>,
+    pub source_device: u64,
+    pub source_inode: u64,
+    pub source_size: u64,
+    pub source_sha256: String,
+    pub change_kind: ChangeKind,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub record_count: usize,
+    pub records: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredBatch {
+    pub path: PathBuf,
+    pub batch: SpoolBatch,
 }
 
 impl SpoolWriter {
     pub fn new(spool_root: PathBuf) -> Result<Self> {
         let pending_dir = spool_root.join("pending");
+        let processed_dir = spool_root.join("processed");
         fs::create_dir_all(&pending_dir)
             .with_context(|| format!("failed to create {}", pending_dir.display()))?;
-        Ok(Self { pending_dir })
+        fs::create_dir_all(&processed_dir)
+            .with_context(|| format!("failed to create {}", processed_dir.display()))?;
+        Ok(Self {
+            pending_dir,
+            processed_dir,
+        })
     }
 
     pub fn write_batch(&self, batch: &SpoolBatch) -> Result<PathBuf> {
@@ -46,6 +59,46 @@ impl SpoolWriter {
         fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
         fs::rename(&tmp, &target)
             .with_context(|| format!("failed to move {} to {}", tmp.display(), target.display()))?;
+        Ok(target)
+    }
+
+    pub fn load_pending_batches(&self) -> Result<Vec<StoredBatch>> {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&self.pending_dir)
+            .with_context(|| format!("failed to read {}", self.pending_dir.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!("failed to read entry in {}", self.pending_dir.display())
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+
+            let bytes =
+                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+            let batch: SpoolBatch = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            entries.push(StoredBatch { path, batch });
+        }
+
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+
+    pub fn mark_processed(&self, batch: &StoredBatch) -> Result<PathBuf> {
+        let file_name = batch
+            .path
+            .file_name()
+            .with_context(|| format!("missing file name for {}", batch.path.display()))?;
+        let target = self.processed_dir.join(file_name);
+        fs::rename(&batch.path, &target).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                batch.path.display(),
+                target.display()
+            )
+        })?;
         Ok(target)
     }
 }

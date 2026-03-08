@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+use crate::git_sync::{RepoSync, SyncOptions};
 use crate::scan::{ChangeKind, ScannedSession, SessionScanner};
 use crate::spool::{SpoolBatch, SpoolWriter};
 use crate::state::{StateStore, StoredSession};
@@ -24,6 +25,7 @@ pub struct Cli {
 enum Command {
     Inspect(InspectArgs),
     IngestOnce(IngestOnceArgs),
+    SyncRepo(SyncRepoArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -56,10 +58,29 @@ struct IngestOnceArgs {
     spool_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Args)]
+struct SyncRepoArgs {
+    #[arg(long, default_value_os_t = default_spool_dir())]
+    spool_dir: PathBuf,
+
+    #[arg(long)]
+    repo: PathBuf,
+
+    #[arg(long, default_value = "origin")]
+    remote: String,
+
+    #[arg(long, default_value = "main")]
+    branch: String,
+
+    #[arg(long)]
+    no_push: bool,
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Inspect(args) => inspect(args),
         Command::IngestOnce(args) => ingest_once(args),
+        Command::SyncRepo(args) => sync_repo(args),
     }
 }
 
@@ -151,6 +172,40 @@ fn ingest_once(args: IngestOnceArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+
+    Ok(())
+}
+
+fn sync_repo(args: SyncRepoArgs) -> Result<()> {
+    let spool = SpoolWriter::new(args.spool_dir.clone())?;
+    let pending = spool.load_pending_batches()?;
+
+    if pending.is_empty() {
+        println!("spool_dir: {}", args.spool_dir.display());
+        println!("pending_batches: 0");
+        return Ok(());
+    }
+
+    let repo = RepoSync::new(
+        args.repo.clone(),
+        SyncOptions {
+            remote: args.remote,
+            branch: args.branch,
+            push: !args.no_push,
+        },
+    )?;
+    let summary = repo.import_batches(&pending)?;
+
+    for batch in &pending {
+        spool.mark_processed(batch)?;
+    }
+
+    println!("repo: {}", args.repo.display());
+    println!("spool_dir: {}", args.spool_dir.display());
+    println!("pending_batches: {}", pending.len());
+    println!("imported_files: {}", summary.imported_files);
+    println!("created_commit: {}", summary.created_commit);
+    println!("pushed: {}", summary.pushed);
 
     Ok(())
 }

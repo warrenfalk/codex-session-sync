@@ -1,4 +1,5 @@
 mod cli;
+mod git_sync;
 mod scan;
 mod spool;
 mod state;

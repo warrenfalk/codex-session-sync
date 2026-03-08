@@ -159,3 +159,120 @@ impl StateStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use anyhow::Result;
+
+    use super::StoredSession;
+    use crate::scan::{ChangeKind, ScannedSession, SessionScanner};
+
+    #[test]
+    fn detects_appended_file_for_resumed_session_path() -> Result<()> {
+        let root = temp_dir("append");
+        let session_path = root
+            .join("2026")
+            .join("02")
+            .join("09")
+            .join("rollout-2026-02-09T19-11-34-example.jsonl");
+        write_session_file(
+            &session_path,
+            &[
+                r#"{"timestamp":"2026-02-09T19:11:34Z","type":"session_meta","payload":{"id":"session-1"}}"#,
+                r#"{"timestamp":"2026-02-09T19:12:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            ],
+        )?;
+
+        let initial = scan_one(&root)?;
+        append_line(
+            &session_path,
+            r#"{"timestamp":"2026-03-08T00:00:00Z","type":"event_msg","payload":{"type":"context_compacted"}}"#,
+        )?;
+        let current = scan_one(&root)?;
+
+        let stored = stored_session_from_scan(&initial);
+        assert_eq!(stored.classify(&current), ChangeKind::Appended);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn detects_rewrite_when_existing_prefix_changes() -> Result<()> {
+        let root = temp_dir("rewrite");
+        let session_path = root.join("session.jsonl");
+        write_session_file(
+            &session_path,
+            &[
+                r#"{"timestamp":"2026-03-08T00:00:00Z","type":"session_meta","payload":{"id":"session-2"}}"#,
+                r#"{"timestamp":"2026-03-08T00:01:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            ],
+        )?;
+
+        let initial = scan_one(&root)?;
+        write_session_file(
+            &session_path,
+            &[
+                r#"{"timestamp":"2026-03-08T00:00:00Z","type":"session_meta","payload":{"id":"session-2"}}"#,
+                r#"{"timestamp":"2026-03-08T00:01:30Z","type":"event_msg","payload":{"type":"different_event"}}"#,
+            ],
+        )?;
+        let current = scan_one(&root)?;
+
+        let stored = stored_session_from_scan(&initial);
+        assert_eq!(stored.classify(&current), ChangeKind::Rewritten);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn scan_one(root: &Path) -> Result<ScannedSession> {
+        let mut sessions = SessionScanner::new(root.to_path_buf()).scan()?;
+        Ok(sessions.remove(0))
+    }
+
+    fn stored_session_from_scan(scan: &ScannedSession) -> StoredSession {
+        StoredSession {
+            path_key: scan.path_key.clone(),
+            device: scan.device,
+            inode: scan.inode,
+            size: scan.size,
+            mtime_ns: scan.mtime_ns,
+            sha256: scan.sha256.clone(),
+            tail_sha256: scan.tail_sha256.clone(),
+            tail_len: scan.tail_len,
+            line_count: scan.line_count,
+            session_id: scan.session_id.clone(),
+            last_record_type: scan.last_record_type.clone(),
+        }
+    }
+
+    fn write_session_file(path: &Path, lines: &[&str]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut content = lines.join("\n");
+        content.push('\n');
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    fn append_line(path: &Path, line: &str) -> Result<()> {
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        writeln!(file, "{line}")?;
+        Ok(())
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("codex-session-sync-{label}-{suffix}"))
+    }
+}
