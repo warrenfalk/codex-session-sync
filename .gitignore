@@ -1,0 +1,5 @@
+.direnv/
+.cargo-home/
+.rustup-home/
+target/
+result
