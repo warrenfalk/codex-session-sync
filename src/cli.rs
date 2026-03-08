@@ -187,6 +187,7 @@ fn sync_repo(args: SyncRepoArgs) -> Result<()> {
     println!("imported_files: {}", summary.imported_files);
     println!("created_commit: {}", summary.created_commit);
     println!("pushed: {}", summary.pushed);
+    println!("skipped_due_to_lock: {}", summary.skipped_due_to_lock);
 
     Ok(())
 }
@@ -224,6 +225,7 @@ fn daemon(args: DaemonArgs) -> Result<()> {
                 imported_files = sync.imported_files,
                 created_commit = sync.created_commit,
                 pushed = sync.pushed,
+                skipped_due_to_lock = sync.skipped_due_to_lock,
                 "sync cycle complete"
             ),
             Err(error) => tracing::error!(iteration, error = %error, "sync cycle failed"),
@@ -325,14 +327,17 @@ fn run_sync_repo(spool_dir: &Path, repo: &Path, options: SyncOptions) -> Result<
             imported_files: 0,
             created_commit: false,
             pushed: false,
+            skipped_due_to_lock: false,
         });
     }
 
     let repo = RepoSync::new(repo.to_path_buf(), options)?;
     let summary = repo.import_batches(&pending)?;
 
-    for batch in &pending {
-        spool.mark_processed(batch)?;
+    if !summary.skipped_due_to_lock {
+        for batch in &pending {
+            spool.mark_processed(batch)?;
+        }
     }
 
     Ok(SyncRunSummary {
@@ -340,6 +345,7 @@ fn run_sync_repo(spool_dir: &Path, repo: &Path, options: SyncOptions) -> Result<
         imported_files: summary.imported_files,
         created_commit: summary.created_commit,
         pushed: summary.pushed,
+        skipped_due_to_lock: summary.skipped_due_to_lock,
     })
 }
 
@@ -392,4 +398,5 @@ struct SyncRunSummary {
     imported_files: usize,
     created_commit: bool,
     pushed: bool,
+    skipped_due_to_lock: bool,
 }

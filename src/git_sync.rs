@@ -1,5 +1,7 @@
+use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -25,6 +27,7 @@ pub struct SyncSummary {
     pub imported_files: usize,
     pub created_commit: bool,
     pub pushed: bool,
+    pub skipped_due_to_lock: bool,
 }
 
 impl RepoSync {
@@ -34,6 +37,13 @@ impl RepoSync {
     }
 
     pub fn import_batches(&self, batches: &[StoredBatch]) -> Result<SyncSummary> {
+        let Some(_lock) = RepoLock::acquire(&self.repo)? else {
+            return Ok(SyncSummary {
+                skipped_due_to_lock: true,
+                ..SyncSummary::default()
+            });
+        };
+
         ensure_clean_worktree(&self.repo)?;
 
         if self.options.push && remote_exists(&self.repo, &self.options.remote)? {
@@ -71,6 +81,7 @@ impl RepoSync {
             imported_files,
             created_commit,
             pushed,
+            skipped_due_to_lock: false,
         })
     }
 
@@ -109,7 +120,16 @@ fn ensure_repo(path: &Path) -> Result<()> {
 }
 
 fn ensure_clean_worktree(repo: &Path) -> Result<()> {
-    let output = git(repo, ["status", "--porcelain"])?;
+    let output = git(
+        repo,
+        [
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":(exclude).codex-session-sync.lock",
+        ],
+    )?;
     if !output.stdout.trim().is_empty() {
         bail!(
             "sync repo {} has uncommitted changes; refusing to import into a dirty worktree",
@@ -239,6 +259,45 @@ impl From<Output> for GitOutput {
     }
 }
 
+struct RepoLock {
+    path: PathBuf,
+}
+
+impl RepoLock {
+    fn acquire(repo: &Path) -> Result<Option<Self>> {
+        let path = repo.join(".codex-session-sync.lock");
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                write_lock_metadata(&path)?;
+                Ok(Some(Self { path }))
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create lock directory {}", path.display())),
+        }
+    }
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            tracing::warn!(error = %error, path = %self.path.display(), "failed to remove repo lock");
+        }
+    }
+}
+
+fn write_lock_metadata(lock_dir: &Path) -> Result<()> {
+    let metadata_path = lock_dir.join("owner.json");
+    let hostname = env::var("HOSTNAME").ok();
+    let payload = serde_json::json!({
+        "pid": std::process::id(),
+        "hostname": hostname,
+    });
+    fs::write(&metadata_path, serde_json::to_vec_pretty(&payload)?)
+        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -297,6 +356,58 @@ mod tests {
                 .join("session-1")
                 .join("batches")
                 .join("batch-1.json")
+                .exists()
+        );
+
+        fs::remove_dir_all(repo_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn skips_sync_when_repo_lock_is_already_held() -> Result<()> {
+        let repo_dir = temp_dir("repo-locked");
+        fs::create_dir_all(&repo_dir)?;
+        git_init(&repo_dir)?;
+        fs::create_dir(repo_dir.join(".codex-session-sync.lock"))?;
+
+        let batch = StoredBatch {
+            path: repo_dir.join("pending-batch.json"),
+            batch: SpoolBatch {
+                schema_version: 1,
+                batch_id: "batch-locked".to_string(),
+                ingested_at_unix_ms: 1,
+                source_path: "/tmp/session.jsonl".to_string(),
+                source_session_id: Some("session-1".to_string()),
+                source_device: 1,
+                source_inode: 2,
+                source_size: 3,
+                source_sha256: "abc".to_string(),
+                change_kind: ChangeKind::Appended,
+                start_line: 10,
+                end_line: 11,
+                record_count: 1,
+                records: vec![json!({"type": "event_msg"})],
+            },
+        };
+
+        let sync = RepoSync::new(
+            repo_dir.clone(),
+            SyncOptions {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+                push: false,
+            },
+        )?;
+        let summary = sync.import_batches(&[batch])?;
+
+        assert!(summary.skipped_due_to_lock);
+        assert_eq!(summary.imported_files, 0);
+        assert!(
+            !repo_dir
+                .join("sessions")
+                .join("session-1")
+                .join("batches")
+                .join("batch-locked.json")
                 .exists()
         );
 
