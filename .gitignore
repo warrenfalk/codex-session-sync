@@ -3,3 +3,4 @@
 .rustup-home/
 target/
 result
+var/
