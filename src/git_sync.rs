@@ -64,7 +64,7 @@ impl RepoSync {
 
         ensure_clean_worktree(&self.repo)?;
 
-        if self.options.push && remote_exists(&self.repo, &self.options.remote)? {
+        if remote_exists(&self.repo, &self.options.remote)? {
             pull_rebase(&self.repo, &self.options.remote, &self.options.branch)?;
         }
 
@@ -726,6 +726,78 @@ mod tests {
         fs::remove_dir_all(remote_dir)?;
         fs::remove_dir_all(target_dir)?;
         fs::remove_dir_all(verify_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pulls_remote_changes_even_without_local_batches() -> Result<()> {
+        let remote_dir = temp_dir("pull-remote");
+        let seed_dir = temp_dir("pull-seed");
+        let clone_dir = temp_dir("pull-clone");
+        let writer_dir = temp_dir("pull-writer");
+
+        fs::create_dir_all(&remote_dir)?;
+        fs::create_dir_all(&seed_dir)?;
+        git_init_bare(&remote_dir)?;
+        git_init(&seed_dir)?;
+        git(
+            seed_dir.as_path(),
+            ["commit", "--allow-empty", "-m", "Initial commit"],
+        )?;
+        git(seed_dir.as_path(), ["branch", "-M", "main"])?;
+        git(
+            seed_dir.as_path(),
+            ["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        )?;
+        git(seed_dir.as_path(), ["push", "-u", "origin", "main"])?;
+
+        git_clone(&remote_dir, &clone_dir)?;
+        git_clone(&remote_dir, &writer_dir)?;
+        fs::create_dir_all(
+            writer_dir
+                .join("sessions")
+                .join("session-remote")
+                .join("batches"),
+        )?;
+        fs::write(
+            writer_dir
+                .join("sessions")
+                .join("session-remote")
+                .join("batches")
+                .join("batch-remote.json"),
+            "{}\n",
+        )?;
+        git(writer_dir.as_path(), ["add", "."])?;
+        git(writer_dir.as_path(), ["commit", "-m", "Add remote batch"])?;
+        git(writer_dir.as_path(), ["push", "origin", "main"])?;
+
+        let sync = RepoSync::new(
+            clone_dir.clone(),
+            SyncOptions {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+                remote_url: remote_dir.display().to_string(),
+                push: false,
+            },
+        )?;
+        let summary = sync.import_batches(&[])?;
+
+        assert_eq!(summary.imported_files, 0);
+        assert!(!summary.created_commit);
+        assert!(!summary.pushed);
+        assert!(
+            clone_dir
+                .join("sessions")
+                .join("session-remote")
+                .join("batches")
+                .join("batch-remote.json")
+                .exists()
+        );
+
+        fs::remove_dir_all(remote_dir)?;
+        fs::remove_dir_all(seed_dir)?;
+        fs::remove_dir_all(clone_dir)?;
+        fs::remove_dir_all(writer_dir)?;
         Ok(())
     }
 

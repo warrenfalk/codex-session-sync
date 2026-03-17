@@ -411,17 +411,6 @@ fn run_sync_repo(
 ) -> Result<SyncRunSummary> {
     let spool = SpoolWriter::new(spool_dir.to_path_buf())?;
     let pending = spool.load_pending_batches()?;
-
-    if pending.is_empty() {
-        return Ok(SyncRunSummary {
-            pending_batches: 0,
-            imported_files: 0,
-            created_commit: false,
-            pushed: false,
-            skipped_due_to_lock: false,
-        });
-    }
-
     let repo = RepoSync::new(sync_config.repo_path.clone(), options)?;
     let summary = repo.import_batches(&pending)?;
 

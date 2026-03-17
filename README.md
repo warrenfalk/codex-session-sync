@@ -195,6 +195,8 @@ If you want to skip pushing and only create a local commit in the target repo:
 cargo run -- sync-repo --no-push
 ```
 
+`--no-push` still pulls remote changes into the local clone. It only disables the final push step.
+
 If the configured local repo path does not exist yet, the tool will clone `remote_url` into it automatically.
 
 If the repo has an `origin` remote and you do not pass `--no-push`, the tool will:
@@ -204,6 +206,8 @@ If the repo has an `origin` remote and you do not pass `--no-push`, the tool wil
 3. commit
 4. push
 5. retry with rebase if the push races with another clone
+
+Even if there are no local pending batches, the sync step still refreshes the local repo from the remote so this machine can see sessions uploaded elsewhere.
 
 ### Daemon
 
