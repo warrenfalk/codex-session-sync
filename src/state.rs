@@ -232,8 +232,8 @@ mod tests {
     }
 
     fn scan_one(root: &Path) -> Result<ScannedSession> {
-        let mut sessions = SessionScanner::new(root.to_path_buf()).scan()?;
-        Ok(sessions.remove(0))
+        let mut report = SessionScanner::new(root.to_path_buf()).scan()?;
+        Ok(report.sessions.remove(0))
     }
 
     fn stored_session_from_scan(scan: &ScannedSession) -> StoredSession {

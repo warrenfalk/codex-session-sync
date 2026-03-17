@@ -13,7 +13,7 @@ use crate::config::{
     ResolvedSyncConfig, default_codex_dir, default_config_path, load_sync_config, write_sync_config,
 };
 use crate::git_sync::{RepoSetupStatus, RepoSync, SyncOptions, prepare_repo};
-use crate::scan::{ChangeKind, ScannedSession, SessionScanner};
+use crate::scan::{ChangeKind, ScanWarning, ScannedSession, SessionScanner};
 use crate::spool::{SpoolBatch, SpoolWriter};
 use crate::state::{StateStore, StoredSession};
 
@@ -178,7 +178,10 @@ fn configure() -> Result<()> {
 fn inspect(args: InspectArgs) -> Result<()> {
     let previous = load_state_if_present(&args.common.state_db)?;
     let scanner = SessionScanner::new(args.common.root.clone());
-    let sessions = scanner.scan()?;
+    let report = scanner.scan()?;
+    let warnings = report.warnings;
+    log_scan_warnings(&warnings);
+    let sessions = report.sessions;
 
     let mut counts = BTreeMap::<ChangeKind, usize>::new();
     let mut rows = Vec::with_capacity(sessions.len());
@@ -203,6 +206,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
 
     println!("root: {}", args.common.root.display());
     println!("sessions: {}", sessions.len());
+    println!("warnings: {}", warnings.len());
     println!("changes: {}", format_counts_line(&counts));
 
     for (change, session) in rows.into_iter().take(args.limit) {
@@ -224,6 +228,7 @@ fn ingest_once(args: IngestOnceArgs) -> Result<()> {
     println!("state_db: {}", args.common.state_db.display());
     println!("spool_dir: {}", args.spool_dir.display());
     println!("sessions: {}", summary.sessions);
+    println!("warnings: {}", summary.warnings);
     println!("batches_written: {}", summary.batches_written);
     println!("changes: {}", format_counts_line(&summary.counts));
 
@@ -367,7 +372,9 @@ fn run_ingest_once(root: &Path, state_db: &Path, spool_dir: &Path) -> Result<Ing
     let mut state = StateStore::open(state_db)?;
     let previous = state.load_all()?;
     let scanner = SessionScanner::new(root.to_path_buf());
-    let sessions = scanner.scan()?;
+    let report = scanner.scan()?;
+    log_scan_warnings(&report.warnings);
+    let sessions = report.sessions;
     let spool = SpoolWriter::new(spool_dir.to_path_buf())?;
 
     state.begin_transaction()?;
@@ -391,6 +398,7 @@ fn run_ingest_once(root: &Path, state_db: &Path, spool_dir: &Path) -> Result<Ing
 
     Ok(IngestSummary {
         sessions: sessions.len(),
+        warnings: report.warnings.len(),
         batches_written,
         counts,
     })
@@ -611,8 +619,15 @@ fn format_counts_line(counts: &BTreeMap<ChangeKind, usize>) -> String {
         .join(", ")
 }
 
+fn log_scan_warnings(warnings: &[ScanWarning]) {
+    for warning in warnings {
+        tracing::warn!(path = %warning.path.display(), error = warning.message, "skipping session file");
+    }
+}
+
 struct IngestSummary {
     sessions: usize,
+    warnings: usize,
     batches_written: usize,
     counts: BTreeMap<ChangeKind, usize>,
 }
