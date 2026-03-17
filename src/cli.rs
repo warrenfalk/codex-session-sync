@@ -1,14 +1,18 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::{ResolvedSyncConfig, default_codex_dir, default_config_path, load_sync_config};
-use crate::git_sync::{RepoSync, SyncOptions};
+use crate::config::{
+    ResolvedSyncConfig, default_codex_dir, default_config_path, load_sync_config, write_sync_config,
+};
+use crate::git_sync::{RepoSetupStatus, RepoSync, SyncOptions, prepare_repo};
 use crate::scan::{ChangeKind, ScannedSession, SessionScanner};
 use crate::spool::{SpoolBatch, SpoolWriter};
 use crate::state::{StateStore, StoredSession};
@@ -20,8 +24,11 @@ use crate::state::{StateStore, StoredSession};
     about = "Sync Codex session logs into an append-only store"
 )]
 pub struct Cli {
+    #[arg(long)]
+    configure: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -120,12 +127,52 @@ struct DaemonArgs {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Daemon(args) => daemon(args),
-        Command::Inspect(args) => inspect(args),
-        Command::IngestOnce(args) => ingest_once(args),
-        Command::SyncRepo(args) => sync_repo(args),
+    match (cli.configure, cli.command) {
+        (true, None) => configure(),
+        (true, Some(_)) => bail!("--configure cannot be combined with a subcommand"),
+        (false, Some(Command::Daemon(args))) => daemon(args),
+        (false, Some(Command::Inspect(args))) => inspect(args),
+        (false, Some(Command::IngestOnce(args))) => ingest_once(args),
+        (false, Some(Command::SyncRepo(args))) => sync_repo(args),
+        (false, None) => bail!("no command provided; use --configure or a subcommand"),
     }
+}
+
+fn configure() -> Result<()> {
+    let config_path = default_config_path();
+    let existing = load_sync_config(&config_path)?;
+    let config = prompt_sync_config(&config_path, existing.as_ref())?;
+    let repo_status = prepare_repo(&config.repo_path, &config.remote_url, &config.branch)
+        .with_context(|| {
+            format!(
+                "failed to prepare local repo {} from {}",
+                config.repo_path.display(),
+                config.remote_url
+            )
+        })?;
+    write_sync_config(&config)?;
+
+    println!("config: {}", config.path.display());
+    println!("remote_url: {}", config.remote_url);
+    println!("branch: {}", config.branch);
+    println!("repo_path: {}", config.repo_path.display());
+    println!(
+        "repo_status: {}",
+        match repo_status {
+            RepoSetupStatus::ExistingRepo => "existing_repo_verified",
+            RepoSetupStatus::Cloned => "cloned",
+        }
+    );
+
+    match restart_user_service("codex-session-sync.service") {
+        Ok(()) => println!("daemon_restart: ok"),
+        Err(error) => {
+            println!("daemon_restart: skipped");
+            println!("daemon_restart_error: {error}");
+        }
+    }
+
+    Ok(())
 }
 
 fn inspect(args: InspectArgs) -> Result<()> {
@@ -389,6 +436,14 @@ fn default_sessions_root() -> PathBuf {
     default_codex_dir().join("sessions")
 }
 
+fn default_repo_path_for_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_codex_dir)
+        .join("session-sync-repo")
+}
+
 fn default_state_db() -> PathBuf {
     default_state_home()
         .join("codex-session-sync")
@@ -462,6 +517,78 @@ fn resolve_sync_config(
     }
 
     Ok(Some(config))
+}
+
+fn prompt_sync_config(
+    config_path: &Path,
+    existing: Option<&ResolvedSyncConfig>,
+) -> Result<ResolvedSyncConfig> {
+    let remote_url = prompt_required(
+        "Remote repository URL",
+        existing.map(|config| config.remote_url.as_str()),
+    )?;
+    let branch = existing
+        .map(|config| config.branch.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let repo_path = existing
+        .map(|config| config.repo_path.clone())
+        .unwrap_or_else(|| default_repo_path_for_config(config_path));
+
+    println!("branch: {}", branch);
+    println!("repo_path: {}", repo_path.display());
+
+    Ok(ResolvedSyncConfig {
+        path: config_path.to_path_buf(),
+        remote_url,
+        branch,
+        repo_path,
+    })
+}
+
+fn prompt_required(label: &str, default: Option<&str>) -> Result<String> {
+    let mut stdout = io::stdout();
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        match default {
+            Some(default) => write!(stdout, "{label} [{default}]: ")?,
+            None => write!(stdout, "{label}: ")?,
+        }
+        stdout.flush()?;
+
+        line.clear();
+        stdin.read_line(&mut line)?;
+        let value = line.trim();
+
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+        if let Some(default) = default {
+            return Ok(default.to_string());
+        }
+    }
+}
+
+fn restart_user_service(service: &str) -> Result<()> {
+    let output = ProcessCommand::new("systemctl")
+        .args(["--user", "restart", service])
+        .output()
+        .context("failed to run systemctl --user restart")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("systemctl exited with status {}", output.status)
+    };
+    bail!("{detail}")
 }
 
 fn format_counts(counts: &BTreeMap<ChangeKind, usize>) -> Vec<(ChangeKind, usize)> {

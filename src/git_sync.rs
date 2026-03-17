@@ -15,6 +15,12 @@ pub struct RepoSync {
     options: SyncOptions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoSetupStatus {
+    ExistingRepo,
+    Cloned,
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
     pub remote: String,
@@ -126,9 +132,21 @@ impl RepoSync {
     }
 }
 
-fn ensure_repo_or_clone(path: &Path, remote_url: &str, branch: &str) -> Result<()> {
+pub fn prepare_repo(path: &Path, remote_url: &str, branch: &str) -> Result<RepoSetupStatus> {
     if path.join(".git").exists() {
-        return Ok(());
+        git(
+            path,
+            ["ls-remote", "--exit-code", "--heads", remote_url, branch],
+        )?;
+        return Ok(RepoSetupStatus::ExistingRepo);
+    }
+
+    ensure_repo_or_clone(path, remote_url, branch)
+}
+
+fn ensure_repo_or_clone(path: &Path, remote_url: &str, branch: &str) -> Result<RepoSetupStatus> {
+    if path.join(".git").exists() {
+        return Ok(RepoSetupStatus::ExistingRepo);
     }
 
     if path.exists() {
@@ -158,7 +176,7 @@ fn ensure_repo_or_clone(path: &Path, remote_url: &str, branch: &str) -> Result<(
         &clone_parent,
         ["clone", "--branch", branch, remote_url, clone_target],
     )?;
-    Ok(())
+    Ok(RepoSetupStatus::Cloned)
 }
 
 fn ensure_clean_worktree(repo: &Path) -> Result<()> {
@@ -357,7 +375,7 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{RepoSync, SyncOptions, SyncSummary};
+    use super::{RepoSetupStatus, RepoSync, SyncOptions, SyncSummary, prepare_repo};
     use crate::scan::ChangeKind;
     use crate::spool::{SpoolBatch, StoredBatch};
 
@@ -629,6 +647,34 @@ mod tests {
         fs::remove_dir_all(remote_dir)?;
         fs::remove_dir_all(seed_dir)?;
         fs::remove_dir_all(target_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_repo_verifies_existing_repo_access() -> Result<()> {
+        let remote_dir = temp_dir("prepare-existing-remote");
+        let seed_dir = temp_dir("prepare-existing-seed");
+
+        fs::create_dir_all(&remote_dir)?;
+        fs::create_dir_all(&seed_dir)?;
+        git_init_bare(&remote_dir)?;
+        git_init(&seed_dir)?;
+        git(
+            seed_dir.as_path(),
+            ["commit", "--allow-empty", "-m", "Initial commit"],
+        )?;
+        git(seed_dir.as_path(), ["branch", "-M", "main"])?;
+        git(
+            seed_dir.as_path(),
+            ["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        )?;
+        git(seed_dir.as_path(), ["push", "-u", "origin", "main"])?;
+
+        let status = prepare_repo(&seed_dir, remote_dir.to_str().unwrap(), "main")?;
+        assert_eq!(status, RepoSetupStatus::ExistingRepo);
+
+        fs::remove_dir_all(remote_dir)?;
+        fs::remove_dir_all(seed_dir)?;
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SyncConfigFile {
@@ -20,6 +20,13 @@ pub struct ResolvedSyncConfig {
     pub remote_url: String,
     pub branch: String,
     pub repo_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PersistedSyncConfig<'a> {
+    remote_url: &'a str,
+    branch: &'a str,
+    repo_path: &'a Path,
 }
 
 pub fn load_sync_config(path: &Path) -> Result<Option<ResolvedSyncConfig>> {
@@ -47,6 +54,24 @@ pub fn load_sync_config(path: &Path) -> Result<Option<ResolvedSyncConfig>> {
     }))
 }
 
+pub fn write_sync_config(config: &ResolvedSyncConfig) -> Result<()> {
+    if let Some(parent) = config.path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let serialized = toml::to_string_pretty(&PersistedSyncConfig {
+        remote_url: &config.remote_url,
+        branch: &config.branch,
+        repo_path: &config.repo_path,
+    })
+    .context("failed to serialize sync config")?;
+
+    fs::write(&config.path, serialized)
+        .with_context(|| format!("failed to write {}", config.path.display()))?;
+    Ok(())
+}
+
 pub fn default_config_path() -> PathBuf {
     default_codex_dir().join("sync.toml")
 }
@@ -69,7 +94,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::load_sync_config;
+    use super::{ResolvedSyncConfig, load_sync_config, write_sync_config};
 
     #[test]
     fn defaults_repo_path_next_to_config_file() -> Result<()> {
@@ -81,6 +106,29 @@ mod tests {
         let config = load_sync_config(&config_path)?.expect("config should load");
         assert_eq!(config.branch, "main");
         assert_eq!(config.repo_path, root.join("session-sync-repo"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn writes_round_trip_config() -> Result<()> {
+        let root = temp_dir("config-write");
+        fs::create_dir_all(&root)?;
+        let config_path = root.join("sync.toml");
+        let expected = ResolvedSyncConfig {
+            path: config_path.clone(),
+            remote_url: "git@github.com:example/repo.git".to_string(),
+            branch: "main".to_string(),
+            repo_path: root.join("session-sync-repo"),
+        };
+
+        write_sync_config(&expected)?;
+
+        let actual = load_sync_config(&config_path)?.expect("config should load");
+        assert_eq!(actual.remote_url, expected.remote_url);
+        assert_eq!(actual.branch, expected.branch);
+        assert_eq!(actual.repo_path, expected.repo_path);
 
         fs::remove_dir_all(root)?;
         Ok(())

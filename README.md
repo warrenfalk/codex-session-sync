@@ -4,7 +4,31 @@
 
 The local Codex client writes JSONL session files under `~/.codex/sessions`. This project watches those files by scanning them, detects whether each file is new, appended, or rewritten, and writes normalized batch files into a local spool. Those spool batches can then be imported into a separate Git repository that acts as the centralized store.
 
-The current implementation is CLI-first. It supports one-shot inspection and ingestion, one-shot sync into a Git repo, and a polling daemon loop.
+The current implementation is CLI-first. It supports interactive first-time setup, one-shot inspection and ingestion, one-shot sync into a Git repo, and a polling daemon loop.
+
+## Quick Start
+
+After installing the package and enabling the user service, the simplest setup path is:
+
+```bash
+codex-session-sync --configure
+```
+
+That flow will:
+
+- ask for the remote Git repository URL
+- keep the default branch as `main` unless your existing config already says otherwise
+- use `~/.codex/session-sync-repo` as the local clone unless your existing config already says otherwise
+- verify remote access by preparing the local repo, cloning it if needed
+- write `~/.codex/sync.toml`
+- try to restart `codex-session-sync.service`
+
+After that, verify the service:
+
+```bash
+systemctl --user status codex-session-sync.service
+journalctl --user -u codex-session-sync.service -f
+```
 
 ## Sync Configuration
 
@@ -30,7 +54,7 @@ Notes:
 - if `repo_path` is omitted, the local clone defaults to `~/.codex/session-sync-repo`
 - if that local repo path does not exist yet, the sync code will automatically clone `remote_url` into it
 
-If the user service was already installed before `~/.codex/sync.toml` existed, it may have started once and then exited cleanly. After creating the config file, start or restart the user service:
+If you prefer to manage the file manually, create `~/.codex/sync.toml` yourself. If the user service was already installed before that file existed, it may have started once and then exited cleanly. After creating the config file, start or restart the user service:
 
 ```bash
 systemctl --user restart codex-session-sync.service
@@ -198,6 +222,22 @@ cargo run -- daemon --config ~/.codex/sync.toml
 
 The daemon currently polls rather than using filesystem notifications.
 If the config file does not exist, the daemon exits successfully without doing any work.
+
+### Configure
+
+Run interactive first-time setup:
+
+```bash
+cargo run -- --configure
+```
+
+Or, for an installed binary:
+
+```bash
+codex-session-sync --configure
+```
+
+This prompt currently asks for the remote repository URL and preserves the existing branch and repo path if you already have a config file. After collecting input, it verifies the repo, writes `~/.codex/sync.toml`, and attempts a `systemctl --user restart codex-session-sync.service`.
 
 ## Runtime Files
 
