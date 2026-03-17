@@ -134,10 +134,7 @@ impl RepoSync {
 
 pub fn prepare_repo(path: &Path, remote_url: &str, branch: &str) -> Result<RepoSetupStatus> {
     if path.join(".git").exists() {
-        git(
-            path,
-            ["ls-remote", "--exit-code", "--heads", remote_url, branch],
-        )?;
+        git(path, ["ls-remote", "--heads", remote_url, branch])?;
         return Ok(RepoSetupStatus::ExistingRepo);
     }
 
@@ -172,11 +169,51 @@ fn ensure_repo_or_clone(path: &Path, remote_url: &str, branch: &str) -> Result<R
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid repo path {}", path.display()))?;
 
-    git(
-        &clone_parent,
-        ["clone", "--branch", branch, remote_url, clone_target],
-    )?;
+    match detect_remote_branch_state(&clone_parent, remote_url, branch)? {
+        RemoteBranchState::BranchExists => {
+            git(
+                &clone_parent,
+                ["clone", "--branch", branch, remote_url, clone_target],
+            )?;
+        }
+        RemoteBranchState::EmptyRemote => {
+            git(&clone_parent, ["clone", remote_url, clone_target])?;
+            git(&path.to_path_buf(), ["branch", "-M", branch])?;
+        }
+        RemoteBranchState::MissingBranch => {
+            bail!(
+                "remote {} does not have branch {} and is not empty",
+                remote_url,
+                branch
+            );
+        }
+    }
+
     Ok(RepoSetupStatus::Cloned)
+}
+
+enum RemoteBranchState {
+    BranchExists,
+    EmptyRemote,
+    MissingBranch,
+}
+
+fn detect_remote_branch_state(
+    repo: &Path,
+    remote_url: &str,
+    branch: &str,
+) -> Result<RemoteBranchState> {
+    let branch_output = git(repo, ["ls-remote", "--heads", remote_url, branch])?;
+    if !branch_output.stdout.trim().is_empty() {
+        return Ok(RemoteBranchState::BranchExists);
+    }
+
+    let heads_output = git(repo, ["ls-remote", "--heads", remote_url])?;
+    if heads_output.stdout.trim().is_empty() {
+        Ok(RemoteBranchState::EmptyRemote)
+    } else {
+        Ok(RemoteBranchState::MissingBranch)
+    }
 }
 
 fn ensure_clean_worktree(repo: &Path) -> Result<()> {
@@ -647,6 +684,48 @@ mod tests {
         fs::remove_dir_all(remote_dir)?;
         fs::remove_dir_all(seed_dir)?;
         fs::remove_dir_all(target_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bootstraps_empty_remote_and_pushes_first_branch() -> Result<()> {
+        let remote_dir = temp_dir("empty-remote");
+        let target_dir = temp_dir("empty-target");
+        let verify_dir = temp_dir("empty-verify");
+
+        fs::create_dir_all(&remote_dir)?;
+        git_init_bare(&remote_dir)?;
+        fs::remove_dir_all(&target_dir).ok();
+
+        let batch = test_batch("batch-empty", "session-empty", json!({"writer": "A"}));
+        let sync = RepoSync::new(
+            target_dir.clone(),
+            SyncOptions {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+                remote_url: remote_dir.display().to_string(),
+                push: true,
+            },
+        )?;
+        let summary = sync.import_batches(&[batch])?;
+
+        assert_eq!(summary.imported_files, 1);
+        assert!(summary.created_commit);
+        assert!(summary.pushed);
+
+        git_clone(&remote_dir, &verify_dir)?;
+        assert!(
+            verify_dir
+                .join("sessions")
+                .join("session-empty")
+                .join("batches")
+                .join("batch-empty.json")
+                .exists()
+        );
+
+        fs::remove_dir_all(remote_dir)?;
+        fs::remove_dir_all(target_dir)?;
+        fs::remove_dir_all(verify_dir)?;
         Ok(())
     }
 
