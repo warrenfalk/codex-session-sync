@@ -55,6 +55,21 @@ impl RepoSync {
         Ok(())
     }
 
+    pub fn ensure_store_readme(&self) -> Result<bool> {
+        if self.current_head()?.is_some() {
+            return Ok(false);
+        }
+
+        let path = self.repo.join("README.md");
+        if path.exists() {
+            return Ok(false);
+        }
+
+        fs::write(&path, store_readme_contents())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(true)
+    }
+
     pub fn changed_session_hashes_since(
         &self,
         previous_head: Option<&str>,
@@ -386,6 +401,10 @@ fn write_lock_metadata(lock_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn store_readme_contents() -> &'static str {
+    "# Codex Session Sync Store\n\nThis repository stores synchronized Codex session message objects for `codex-session-sync`.\nIt is a data store, not a normal source repository.\n\nThe `sessions/` tree contains immutable message objects keyed by session hash and message content.\n"
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -570,6 +589,7 @@ mod tests {
                 push: true,
             },
         )?;
+        sync.ensure_store_readme()?;
         write_message_object(&target_dir, SHARED_SESSION_HASH, "20260318210000000-initial")?;
         let created = sync.commit_all("Initial sync")?;
         let pushed = sync.push_remote()?;
@@ -581,6 +601,8 @@ mod tests {
         let session_dir = session_dir(&verify_dir, SHARED_SESSION_HASH).join("messages");
         let files = collect_file_names(&session_dir)?;
         assert!(files.contains(&"20260318210000000-initial.json".to_string()));
+        let readme = fs::read_to_string(verify_dir.join("README.md"))?;
+        assert!(readme.contains("Codex Session Sync Store"));
 
         fs::remove_dir_all(remote_dir)?;
         fs::remove_dir_all(target_dir)?;

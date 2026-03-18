@@ -40,6 +40,7 @@ pub fn sync_once(
     let Some(summary) = repo.try_run_locked(|repo| {
         let previous_projected_head = state.projected_head()?;
         repo.pull_remote()?;
+        repo.ensure_store_readme()?;
         let mut sessions_to_project = if previous_projected_head.is_some() {
             repo.changed_session_hashes_since(previous_projected_head.as_deref())?
         } else {

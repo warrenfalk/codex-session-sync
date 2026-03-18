@@ -55,6 +55,7 @@ Notes:
 - if `repo_path` is omitted, the local clone defaults to `~/.codex/session-sync-repo`
 - if that local repo path does not exist yet, the sync code will automatically clone `remote_url` into it
 - an empty remote repository is supported; the first successful sync will create the configured branch there
+- when bootstrapping an empty remote, the first sync also creates a top-level `README.md` explaining that the repository is a Codex session data store
 
 If you prefer to manage the file manually, create `~/.codex/sync.toml` yourself. If the user service was already installed before that file existed, it may have started once and then exited cleanly. After creating the config file, start or restart the user service:
 
