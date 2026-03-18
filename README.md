@@ -228,8 +228,10 @@ If `XDG_STATE_HOME` is not set, this falls back to `~/.local/state`.
 The sync repo itself gets a local coordination lock while a sync is in progress:
 
 ```text
-.codex-session-sync.lock/
+.codex-session-sync.lock
 ```
+
+This is a persistent lock file. The actual lock is held by the running process through an OS-backed file lock, so stale pathnames by themselves do not block future syncs.
 
 If another process is already syncing the same checkout, the second process skips that sync cycle and retries later.
 

@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 
 pub struct RepoSync {
     repo: PathBuf,
@@ -364,40 +365,61 @@ impl From<Output> for GitOutput {
 
 struct RepoLock {
     path: PathBuf,
+    _file: File,
 }
 
 impl RepoLock {
     fn acquire(repo: &Path) -> Result<Option<Self>> {
         let path = repo.join(".codex-session-sync.lock");
-        match fs::create_dir(&path) {
+        let mut file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        match file.try_lock_exclusive() {
             Ok(()) => {
-                write_lock_metadata(&path)?;
-                Ok(Some(Self { path }))
+                write_lock_metadata(&mut file)?;
+                Ok(Some(Self { path, _file: file }))
             }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error)
-                .with_context(|| format!("failed to create lock directory {}", path.display())),
+                .with_context(|| format!("failed to lock {}", path.display())),
         }
     }
 }
 
 impl Drop for RepoLock {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.path) {
-            tracing::warn!(error = %error, path = %self.path.display(), "failed to remove repo lock");
+        if let Err(error) = self._file.unlock() {
+            tracing::warn!(error = %error, path = %self.path.display(), "failed to unlock repo lock");
         }
     }
 }
 
-fn write_lock_metadata(lock_dir: &Path) -> Result<()> {
-    let metadata_path = lock_dir.join("owner.json");
+fn write_lock_metadata(file: &mut File) -> Result<()> {
     let hostname = env::var("HOSTNAME").ok();
     let payload = serde_json::json!({
         "pid": std::process::id(),
         "hostname": hostname,
     });
-    fs::write(&metadata_path, serde_json::to_vec_pretty(&payload)?)
-        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+    let bytes = serde_json::to_vec_pretty(&payload)?;
+    file.set_len(0).context("failed to clear lock file")?;
+    file.seek(SeekFrom::Start(0))
+        .context("failed to rewind lock file")?;
+    file.write_all(&bytes)
+        .context("failed to write lock metadata")?;
+    file.write_all(b"\n")
+        .context("failed to terminate lock metadata")?;
+    file.sync_all().context("failed to sync lock metadata")?;
     Ok(())
 }
 
@@ -423,7 +445,7 @@ mod tests {
         let repo_dir = temp_dir("repo-locked");
         fs::create_dir_all(&repo_dir)?;
         git_init(&repo_dir)?;
-        fs::create_dir(repo_dir.join(".codex-session-sync.lock"))?;
+        let held_lock = super::RepoLock::acquire(&repo_dir)?.expect("lock should be acquired");
 
         let sync = RepoSync::new(
             repo_dir.clone(),
@@ -437,6 +459,10 @@ mod tests {
         let ran = sync.try_run_locked(|_| Ok(()))?;
 
         assert!(ran.is_none());
+        drop(held_lock);
+
+        let ran = sync.try_run_locked(|_| Ok("ok"))?;
+        assert_eq!(ran, Some("ok"));
 
         fs::remove_dir_all(repo_dir)?;
         Ok(())
