@@ -187,7 +187,7 @@ fn parse_session_file(path: &Path, _kind: SessionKind) -> Result<ParsedSessionFi
             }
         };
 
-        if index == 0 {
+        if session_id.is_none() {
             session_id = value
                 .get("payload")
                 .and_then(|payload| payload.get("id"))
@@ -308,6 +308,29 @@ mod tests {
         assert!(live.warnings.is_empty());
         assert!(shadows.files.is_empty());
         assert!(shadows.warnings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn finds_session_id_when_session_meta_is_not_first_line() -> Result<()> {
+        let root = temp_dir("session-id-later");
+        fs::create_dir_all(&root)?;
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-03-18T21:04:05.123Z\",\"type\":\"response_item\",\"payload\":{\"kind\":\"message\"}}\n",
+                "{\"timestamp\":\"2026-03-18T21:04:05.123Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-1\"}}\n"
+            ),
+        )?;
+
+        let scanner = SessionFileScanner::new(root.clone());
+        let live = scanner.scan_live()?;
+
+        assert_eq!(live.files.len(), 1);
+        assert_eq!(live.files[0].session_id, "session-1");
+
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
