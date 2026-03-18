@@ -56,7 +56,7 @@ sessions/
     cd/
       <session_hash>/
         messages/
-          <message_hash>.json
+          <YYYYMMDDHHmmssfff>-<message_hash>.json
 ```
 
 Each message file contains metadata plus the raw JSONL line. The exact on-disk encoding may be JSON. A message object must include at least:
@@ -70,6 +70,12 @@ Each message file contains metadata plus the raw JSONL line. The exact on-disk e
 - `source_path`
 
 The repository path is determined only by `session_hash` and `message_hash`.
+
+The filename must begin with the message timestamp in UTC using the format `YYYYMMDDHHmmssfff`.
+This makes lexical filename order match chronological order and makes shell-based inspection easier.
+
+Timestamp alone is not sufficient as a filename because multiple messages may share the same millisecond.
+The `message_hash` suffix is therefore required.
 
 `session_id` must still be stored inside the object for validation and debugging.
 
@@ -114,6 +120,9 @@ Each session state file should contain:
 - optionally `last_known_mtime_ns`
 
 The required fields are `local_path`, `last_scan_offset`, and `last_scan_anchor_hash`.
+
+The design does not rely on active-session detection.
+It instead relies on shadow snapshots during projection.
 
 ### Why Offset Alone Is Not Enough
 
@@ -165,14 +174,25 @@ Sync-down means projecting repository messages back into `~/.codex/sessions`.
 1. Pull the repository.
 2. Determine which sessions changed since `last-projected-head`.
 3. For each changed session:
+   - create a hidden hard-link shadow of the current `local_path` in the same directory, for example:
+     - `.<basename>.sync-shadow-<nonce>`
    - load all message objects for that session
-   - sort them by `timestamp`
+   - load any valid local-only messages recoverable from the shadow file that are not yet in the repository
+   - build the union of:
+     - repository messages for the session
+     - recoverable local-only shadow messages
+   - sort that union by `timestamp`
    - use `message_hash` as the deterministic tie-breaker when timestamps are equal
    - write a `.tmp` file containing `raw_jsonl` lines separated by `\n`
+   - `fsync` the `.tmp` file
    - rename the `.tmp` file atomically into the final `local_path`
+   - keep the shadow file until all messages recoverable from it are present in the repository and reflected in projection
 4. Update `last-projected-head`.
 
 The projection file must end with a trailing newline.
+
+The shadow file is the recovery mechanism for late writes by an uncooperative local Codex process.
+If Codex still holds an open handle to the old inode after projection, those writes land in the old inode, which remains reachable through the shadow path.
 
 ## Feedback Loop Avoidance
 
@@ -190,6 +210,9 @@ This is why correctness depends on object existence and not on offsets.
 
 Offsets only make the common case faster.
 
+Shadow files are not live session files. They are recovery artifacts.
+Normal session scanning should ignore shadow files by name pattern and process them only through dedicated recovery logic.
+
 ## Failure Model
 
 The system must prefer duplicate work over data loss.
@@ -200,6 +223,8 @@ Safe fallback behavior:
 - if the offset anchor does not match, do a full rescan
 - if `last-projected-head` is missing, do a full projection
 - if a message object already exists, treat that as success
+- if a projection race is suspected, keep the shadow file and retry projection later
+- if the local session file is malformed after an uncooperative rewrite, salvage valid lines, ignore broken tails, and reproject from repository messages plus recoverable shadow messages
 
 ## Concurrency Model
 
@@ -213,10 +238,16 @@ This is safe because:
 
 The only repository conflicts that matter are normal Git synchronization conflicts. Those are handled at the repository level, not the session-object level.
 
+Local projection conflicts are handled by:
+
+- preserving the old inode through a shadow hard link
+- rebuilding the canonical local file from the repository plus recoverable local-only shadow messages
+
 ## Important Assumptions
 
 - Every JSONL line contains a usable timestamp.
 - Sorting by timestamp, then by message hash, is sufficient to reconstruct a stable session order.
 - Collapsing identical lines is acceptable.
+- Shadow hard links are created on the same filesystem as the live session file.
 
 If any of those assumptions turn out to be false in real Codex data, this design will need revision.
