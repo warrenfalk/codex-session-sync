@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -15,7 +15,7 @@ use crate::config::ResolvedSyncConfig;
 use crate::file_state::{FileState, SessionState};
 use crate::git_sync::{RepoSync, SyncOptions};
 use crate::message_store::{MessageStore, StoredMessage};
-use crate::session_file::{ParsedSessionFile, ScanWarning, SessionFileScanner, shadow_path_for};
+use crate::session_file::{ParsedSessionFile, ScanWarning, SessionFileScanner, SessionLine, shadow_path_for};
 
 #[derive(Debug, Default)]
 pub struct SyncEngineSummary {
@@ -62,6 +62,13 @@ pub fn sync_once(
         log_warnings(&live_report.warnings);
         let shadow_report = scanner.scan_shadows()?;
         log_warnings(&shadow_report.warnings);
+        let mut shadow_files_by_session = BTreeMap::<String, Vec<ParsedSessionFile>>::new();
+        for file in &shadow_report.files {
+            shadow_files_by_session
+                .entry(file.session_hash.clone())
+                .or_default()
+                .push(file.clone());
+        }
 
         let mut summary = SyncEngineSummary {
             live_sessions: live_report.files.len(),
@@ -79,11 +86,16 @@ pub fn sync_once(
         for file in &shadow_report.files {
             let upsert = store.upsert_session_file(&machine_id, file)?;
             summary.messages_written += upsert.messages_written;
+            sessions_to_project.insert(file.session_hash.clone());
             sessions_to_project.extend(upsert.touched_sessions);
         }
 
         for session_hash in sessions_to_project {
-            if project_session(root, &state, &store, &machine_id, &session_hash)? {
+            let extra_shadows = shadow_files_by_session
+                .get(&session_hash)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if project_session(root, &state, &store, &machine_id, &session_hash, extra_shadows)? {
                 summary.projected_sessions += 1;
             }
         }
@@ -147,11 +159,13 @@ fn project_session(
     store: &MessageStore,
     machine_id: &str,
     session_hash: &str,
+    extra_shadows: &[ParsedSessionFile],
 ) -> Result<bool> {
     let mut messages = store.load_session_messages(session_hash)?;
     if messages.is_empty() {
         return Ok(false);
     }
+    merge_shadow_lines(&mut messages, extra_shadows);
 
     let local_path = resolve_local_path(root, state, &messages[0], session_hash)?;
     ensure_projection_target_safe(root, &local_path)?;
@@ -176,12 +190,69 @@ fn project_session(
             if upsert.messages_written > 0 {
                 messages = store.load_session_messages(session_hash)?;
             }
+            merge_shadow_lines(&mut messages, std::slice::from_ref(&shadow_file));
         }
         shadow = Some(shadow_path);
     }
 
     write_projection(&local_path, &render_messages(&messages), shadow.as_deref())?;
     Ok(true)
+}
+
+fn merge_shadow_lines(messages: &mut Vec<StoredMessage>, shadows: &[ParsedSessionFile]) {
+    let mut seen_hashes = messages
+        .iter()
+        .map(|message| message.message_hash.clone())
+        .collect::<BTreeSet<_>>();
+    for shadow in shadows {
+        for (index, line) in shadow.lines.iter().enumerate() {
+            if seen_hashes.insert(line.message_hash.clone()) {
+                messages.push(stored_message_from_shadow_line(shadow, line, index as u64));
+            }
+        }
+    }
+    messages.sort_by(|left, right| {
+        left.timestamp_key
+            .cmp(&right.timestamp_key)
+            .then_with(|| message_type_rank(left).cmp(&message_type_rank(right)))
+            .then_with(|| {
+                left.source_line_number
+                    .unwrap_or(u64::MAX)
+                    .cmp(&right.source_line_number.unwrap_or(u64::MAX))
+            })
+            .then_with(|| left.message_hash.cmp(&right.message_hash))
+    });
+}
+
+fn stored_message_from_shadow_line(
+    file: &ParsedSessionFile,
+    line: &SessionLine,
+    source_line_number: u64,
+) -> StoredMessage {
+    StoredMessage {
+        session_id: file.session_id.clone(),
+        session_hash: file.session_hash.clone(),
+        message_hash: line.message_hash.clone(),
+        timestamp: line.timestamp.clone(),
+        timestamp_key: line.timestamp_key.clone(),
+        record_type: Some(line.record_type.clone()),
+        raw_jsonl: line.raw_jsonl.clone(),
+        source_machine_id: "shadow-recovery".to_string(),
+        source_path: file.path.to_string_lossy().into_owned(),
+        source_line_number: Some(source_line_number),
+    }
+}
+
+fn message_type_rank(message: &StoredMessage) -> u8 {
+    match message.record_type.as_deref() {
+        Some("session_meta") => 0,
+        Some("event_msg") => 1,
+        Some("response_item") => 2,
+        Some("function_call") => 3,
+        Some("function_call_output") => 4,
+        Some(_) => 5,
+        None => 6,
+    }
 }
 
 fn resolve_local_path(
@@ -554,6 +625,55 @@ mod tests {
 
         assert_eq!(summary.projected_sessions, 0);
         assert_eq!(count_shadow_files(&root)?, 0);
+
+        fs::remove_dir_all(sandbox)?;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_shadow_reprojects_even_without_store_changes() -> Result<()> {
+        let sandbox = temp_dir("shadow-reprojects");
+        let remote = sandbox.join("remote.git");
+        let repo = sandbox.join("repo");
+        let root = sandbox.join("sessions");
+        let state = sandbox.join("state");
+        let live = root.join("2026/03/18/session-a.jsonl");
+
+        fs::create_dir_all(&root)?;
+        git_init_bare(&remote)?;
+        write_session_file(
+            &live,
+            "session-1",
+            &[
+                "2026-03-18T21:00:00.000Z",
+                "2026-03-18T21:00:01.000Z",
+                "2026-03-18T21:00:02.000Z",
+            ],
+        )?;
+
+        let config = sync_config(&repo, &remote);
+        let options = SyncOptions {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            remote_url: remote.display().to_string(),
+            push: true,
+        };
+
+        sync_once(&root, &state, &config, options.clone())?;
+
+        let shadow = crate::session_file::shadow_path_for(&live, "retained")?;
+        fs::hard_link(&live, &shadow)?;
+        write_session_file(
+            &live,
+            "session-1",
+            &["2026-03-18T21:00:00.000Z", "2026-03-18T21:00:01.000Z"],
+        )?;
+
+        let summary = sync_once(&root, &state, &config, options)?;
+        let contents = fs::read_to_string(&live)?;
+
+        assert!(summary.projected_sessions >= 1);
+        assert!(contents.contains("2026-03-18T21:00:02.000Z"));
 
         fs::remove_dir_all(sandbox)?;
         Ok(())

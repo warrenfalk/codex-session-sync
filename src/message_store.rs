@@ -14,9 +14,13 @@ pub struct StoredMessage {
     pub message_hash: String,
     pub timestamp: String,
     pub timestamp_key: String,
+    #[serde(default)]
+    pub record_type: Option<String>,
     pub raw_jsonl: String,
     pub source_machine_id: String,
     pub source_path: String,
+    #[serde(default)]
+    pub source_line_number: Option<u64>,
 }
 
 pub struct MessageStore {
@@ -40,12 +44,13 @@ impl MessageStore {
     ) -> Result<UpsertSummary> {
         let mut touched_sessions = BTreeSet::new();
         let mut messages_written = 0usize;
-        for line in &file.lines {
+        for (index, line) in file.lines.iter().enumerate() {
             if self.write_message(
                 &file.session_id,
                 &file.session_hash,
                 machine_id,
                 &file.path,
+                index as u64,
                 line,
             )? {
                 touched_sessions.insert(file.session_hash.clone());
@@ -64,6 +69,7 @@ impl MessageStore {
         session_hash: &str,
         machine_id: &str,
         source_path: &Path,
+        source_line_number: u64,
         line: &SessionLine,
     ) -> Result<bool> {
         let target = self.message_path(session_hash, &line.timestamp_key, &line.message_hash);
@@ -81,9 +87,11 @@ impl MessageStore {
             message_hash: line.message_hash.clone(),
             timestamp: line.timestamp.clone(),
             timestamp_key: line.timestamp_key.clone(),
+            record_type: Some(line.record_type.clone()),
             raw_jsonl: line.raw_jsonl.clone(),
             source_machine_id: machine_id.to_string(),
             source_path: source_path.to_string_lossy().into_owned(),
+            source_line_number: Some(source_line_number),
         };
         let bytes = serde_json::to_vec_pretty(&message).context("failed to encode message")?;
         fs::write(&target, bytes).with_context(|| format!("failed to write {}", target.display()))?;
@@ -141,6 +149,12 @@ impl MessageStore {
         entries.sort_by(|left, right| {
             left.timestamp_key
                 .cmp(&right.timestamp_key)
+                .then_with(|| message_type_rank(left).cmp(&message_type_rank(right)))
+                .then_with(|| {
+                    left.source_line_number
+                        .unwrap_or(u64::MAX)
+                        .cmp(&right.source_line_number.unwrap_or(u64::MAX))
+                })
                 .then_with(|| left.message_hash.cmp(&right.message_hash))
         });
         Ok(entries)
@@ -161,6 +175,35 @@ impl MessageStore {
             .join(shard_b)
             .join(session_hash)
     }
+}
+
+fn message_type_rank(message: &StoredMessage) -> u8 {
+    let fallback_type = if message.record_type.is_none() {
+        extract_type(&message.raw_jsonl)
+    } else {
+        None
+    };
+    match message
+        .record_type
+        .as_deref()
+        .or(fallback_type.as_deref())
+    {
+        Some("session_meta") => 0,
+        Some("event_msg") => 1,
+        Some("response_item") => 2,
+        Some("function_call") => 3,
+        Some("function_call_output") => 4,
+        Some(_) => 5,
+        None => 6,
+    }
+}
+
+fn extract_type(raw_jsonl: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw_jsonl).ok()?;
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -188,6 +231,7 @@ mod tests {
                 message_hash: "hash-1".to_string(),
                 timestamp: "2026-03-18T21:04:05.123Z".to_string(),
                 timestamp_key: "20260318210405123".to_string(),
+                record_type: "session_meta".to_string(),
             }],
         };
 

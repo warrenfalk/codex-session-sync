@@ -34,6 +34,7 @@ pub struct SessionLine {
     pub message_hash: String,
     pub timestamp: String,
     pub timestamp_key: String,
+    pub record_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +200,11 @@ fn parse_session_file(path: &Path, _kind: SessionKind) -> Result<ParsedSessionFi
             .get("timestamp")
             .and_then(Value::as_str)
             .with_context(|| format!("missing top-level timestamp on line {} in {}", index + 1, path.display()))?;
+        let record_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
         let timestamp_key = timestamp_key(timestamp)?;
         let message_hash = sha256_hex(raw_line);
 
@@ -207,6 +213,7 @@ fn parse_session_file(path: &Path, _kind: SessionKind) -> Result<ParsedSessionFi
             message_hash,
             timestamp: timestamp.to_string(),
             timestamp_key,
+            record_type,
         });
     }
 

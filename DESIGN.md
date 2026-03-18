@@ -65,9 +65,11 @@ Each message file contains metadata plus the raw JSONL line. The exact on-disk e
 - `session_hash`
 - `message_hash`
 - `timestamp`
+- `record_type`
 - `raw_jsonl`
 - `source_machine_id`
 - `source_path`
+- `source_line_number` when known
 
 The repository path is determined only by `session_hash` and `message_hash`.
 
@@ -182,7 +184,15 @@ Sync-down means projecting repository messages back into `~/.codex/sessions`.
      - repository messages for the session
      - recoverable local-only shadow messages
    - sort that union by `timestamp`
-   - use `message_hash` as the deterministic tie-breaker when timestamps are equal
+   - for equal timestamps, prefer a stable semantic order:
+     - `session_meta`
+     - `event_msg`
+     - `response_item`
+     - `function_call`
+     - `function_call_output`
+     - everything else
+   - if source line numbers are known, use them before `message_hash`
+   - use `message_hash` as the final deterministic tie-breaker
    - write a `.tmp` file containing `raw_jsonl` lines separated by `\n`
    - `fsync` the `.tmp` file
    - rename the `.tmp` file atomically into the final `local_path`
@@ -288,7 +298,7 @@ Local projection conflicts are handled by:
 ## Important Assumptions
 
 - Every JSONL line contains a usable timestamp.
-- Sorting by timestamp, then by message hash, is sufficient to reconstruct a stable session order.
+- Sorting by timestamp, then by semantic type rank, then by source line number when known, then by message hash, is sufficient to reconstruct a stable session order.
 - Collapsing identical lines is acceptable.
 - Shadow hard links are created on the same filesystem as the live session file.
 
