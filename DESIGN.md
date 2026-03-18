@@ -56,7 +56,8 @@ sessions/
     cd/
       <session_hash>/
         messages/
-          <YYYYMMDDHHmmssfff>-<message_hash>.json
+          <YYYYMMDDHH>/
+            <YYYYMMDDHHmmssfff>-<message_hash>.json
 ```
 
 Each message file contains metadata plus the raw JSONL line. The exact on-disk encoding may be JSON. A message object must include at least:
@@ -73,8 +74,11 @@ Each message file contains metadata plus the raw JSONL line. The exact on-disk e
 
 The repository path is determined only by `session_hash` and `message_hash`.
 
+Messages are additionally sharded into one hour-wide subdirectory named `YYYYMMDDHH`.
+This keeps any single `messages/` directory from growing too large.
+
 The filename must begin with the message timestamp in UTC using the format `YYYYMMDDHHmmssfff`.
-This makes lexical filename order match chronological order and makes shell-based inspection easier.
+This makes lexical filename order match chronological order and makes shell-based inspection easier within each hour shard.
 
 Timestamp alone is not sufficient as a filename because multiple messages may share the same millisecond.
 The `message_hash` suffix is therefore required.

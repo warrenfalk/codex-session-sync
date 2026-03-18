@@ -134,17 +134,7 @@ impl MessageStore {
         }
 
         let mut entries = Vec::new();
-        for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-            let message: StoredMessage = serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            entries.push(message);
-        }
+        load_messages_from_dir(&dir, &mut entries)?;
 
         entries.sort_by(|left, right| {
             left.timestamp_key
@@ -163,6 +153,7 @@ impl MessageStore {
     fn message_path(&self, session_hash: &str, timestamp_key: &str, message_hash: &str) -> PathBuf {
         self.session_dir(session_hash)
             .join("messages")
+            .join(hour_shard(timestamp_key))
             .join(format!("{timestamp_key}-{message_hash}.json"))
     }
 
@@ -175,6 +166,32 @@ impl MessageStore {
             .join(shard_b)
             .join(session_hash)
     }
+}
+
+fn load_messages_from_dir(dir: &Path, entries: &mut Vec<StoredMessage>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            load_messages_from_dir(&path, entries)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let message: StoredMessage = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        entries.push(message);
+    }
+    Ok(())
+}
+
+fn hour_shard(timestamp_key: &str) -> &str {
+    &timestamp_key[..10]
 }
 
 fn message_type_rank(message: &StoredMessage) -> u8 {
@@ -218,7 +235,7 @@ mod tests {
     use crate::session_file::{ParsedSessionFile, SessionLine};
 
     #[test]
-    fn stores_messages_with_timestamp_hash_filename() -> Result<()> {
+    fn stores_messages_with_hour_sharded_filename() -> Result<()> {
         let root = temp_dir("message-store");
         fs::create_dir_all(&root)?;
         let store = MessageStore::new(root.clone());
@@ -243,6 +260,7 @@ mod tests {
             .join("cd")
             .join("abcd1234")
             .join("messages")
+            .join("2026031821")
             .join("20260318210405123-hash-1.json");
         assert!(target.exists());
 

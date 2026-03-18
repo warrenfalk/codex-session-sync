@@ -97,7 +97,7 @@ At a high level:
 The repository is sharded by session hash and stores message objects named by sortable UTC timestamp plus message hash:
 
 ```text
-sessions/<aa>/<bb>/<session_hash>/messages/<YYYYMMDDHHmmssfff>-<message_hash>.json
+sessions/<aa>/<bb>/<session_hash>/messages/<YYYYMMDDHH>/<YYYYMMDDHHmmssfff>-<message_hash>.json
 ```
 
 ## Current Features

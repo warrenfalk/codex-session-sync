@@ -794,6 +794,7 @@ mod tests {
     fn write_message_object(repo: &Path, session_hash: &str, stem: &str) -> Result<()> {
         let path = session_dir(repo, session_hash)
             .join("messages")
+            .join(&stem[..10])
             .join(format!("{stem}.json"));
         let parent = path.parent().expect("message path parent");
         fs::create_dir_all(parent)?;
@@ -812,7 +813,9 @@ mod tests {
         let mut files = BTreeSet::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            if entry.file_type()?.is_dir() {
+                files.extend(collect_file_names(&entry.path())?);
+            } else if entry.file_type()?.is_file() {
                 files.insert(entry.file_name().to_string_lossy().into_owned());
             }
         }
