@@ -172,7 +172,7 @@ mod tests {
     use anyhow::Result;
 
     use super::MessageStore;
-    use crate::session_file::{ParsedSessionFile, SessionKind, SessionLine};
+    use crate::session_file::{ParsedSessionFile, SessionLine};
 
     #[test]
     fn stores_messages_with_timestamp_hash_filename() -> Result<()> {
@@ -181,7 +181,6 @@ mod tests {
         let store = MessageStore::new(root.clone());
         let file = ParsedSessionFile {
             path: PathBuf::from("/tmp/session.jsonl"),
-            kind: SessionKind::Live,
             session_id: "session-1".to_string(),
             session_hash: "abcd1234".to_string(),
             lines: vec![SessionLine {

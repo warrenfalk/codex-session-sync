@@ -39,7 +39,6 @@ pub struct SessionLine {
 #[derive(Debug, Clone)]
 pub struct ParsedSessionFile {
     pub path: PathBuf,
-    pub kind: SessionKind,
     pub session_id: String,
     pub session_hash: String,
     pub lines: Vec<SessionLine>,
@@ -145,7 +144,7 @@ fn matches_kind(path: &Path, kind: SessionKind) -> bool {
     }
 }
 
-fn parse_session_file(path: &Path, kind: SessionKind) -> Result<ParsedSessionFile> {
+fn parse_session_file(path: &Path, _kind: SessionKind) -> Result<ParsedSessionFile> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let raw_lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
     let file_ends_with_newline = bytes.last().copied() == Some(b'\n');
@@ -219,7 +218,6 @@ fn parse_session_file(path: &Path, kind: SessionKind) -> Result<ParsedSessionFil
 
     Ok(ParsedSessionFile {
         path: path.to_path_buf(),
-        kind,
         session_hash: sha256_hex(session_id.as_bytes()),
         session_id,
         lines,
@@ -268,7 +266,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{SessionFileScanner, SessionKind, is_shadow_path, shadow_path_for};
+    use super::{SessionFileScanner, is_shadow_path, shadow_path_for};
 
     #[test]
     fn parses_live_and_shadow_files_separately() -> Result<()> {
@@ -285,9 +283,7 @@ mod tests {
         let shadows = scanner.scan_shadows()?;
 
         assert_eq!(live.files.len(), 1);
-        assert_eq!(live.files[0].kind, SessionKind::Live);
         assert_eq!(shadows.files.len(), 1);
-        assert_eq!(shadows.files[0].kind, SessionKind::Shadow);
 
         fs::remove_dir_all(root)?;
         Ok(())

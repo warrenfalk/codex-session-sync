@@ -2,10 +2,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -150,30 +152,33 @@ fn project_session(
     }
 
     let local_path = resolve_local_path(root, state, &messages[0], session_hash)?;
+    ensure_projection_target_safe(root, &local_path)?;
     let desired = render_messages(&messages);
     let current = fs::read(&local_path).ok();
     if current.as_deref() == Some(desired.as_slice()) {
         return Ok(false);
     }
 
-        if local_path.exists() {
-            let shadow = shadow_path_for(&local_path, &nonce())?;
-            fs::hard_link(&local_path, &shadow).with_context(|| {
+    let mut shadow = None;
+    if local_path.exists() {
+        let shadow_path = shadow_path_for(&local_path, &nonce())?;
+        fs::hard_link(&local_path, &shadow_path).with_context(|| {
             format!(
                 "failed to create shadow {} from {}",
-                shadow.display(),
+                shadow_path.display(),
                 local_path.display()
             )
-            })?;
-            if let Ok(shadow_file) = parse_shadow_once(&shadow) {
-                let upsert = store.upsert_session_file(machine_id, &shadow_file)?;
-                if upsert.messages_written > 0 {
-                    messages = store.load_session_messages(session_hash)?;
-                }
+        })?;
+        if let Ok(shadow_file) = parse_shadow_once(&shadow_path) {
+            let upsert = store.upsert_session_file(machine_id, &shadow_file)?;
+            if upsert.messages_written > 0 {
+                messages = store.load_session_messages(session_hash)?;
             }
         }
+        shadow = Some(shadow_path);
+    }
 
-    write_projection(&local_path, &render_messages(&messages))?;
+    write_projection(&local_path, &render_messages(&messages), shadow.as_deref())?;
     Ok(true)
 }
 
@@ -221,7 +226,7 @@ fn render_messages(messages: &[StoredMessage]) -> Vec<u8> {
     rendered
 }
 
-fn write_projection(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_projection(path: &Path, bytes: &[u8], shadow: Option<&Path>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -235,8 +240,122 @@ fn write_projection(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()
             .with_context(|| format!("failed to fsync {}", tmp.display()))?;
     }
+    ensure_projection_target_unchanged(path, shadow)?;
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+fn ensure_projection_target_safe(root: &Path, path: &Path) -> Result<()> {
+    if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        bail!("refusing to project into non-jsonl path {}", path.display());
+    }
+    if crate::session_file::is_shadow_path(path) {
+        bail!("refusing to project into shadow path {}", path.display());
+    }
+
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("refusing to project outside {}: {}", root.display(), path.display()))?;
+    for component in relative.components() {
+        use std::path::Component;
+        if !matches!(component, Component::Normal(_)) {
+            bail!("refusing to project into unsafe path {}", path.display());
+        }
+    }
+
+    ensure_no_symlink_components(root, path)?;
+
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!("refusing to overwrite non-regular file {}", path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_no_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in root.components() {
+        current.push(component.as_os_str());
+    }
+    ensure_not_symlink(&current)?;
+
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("refusing to project outside {}: {}", root.display(), path.display()))?;
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        if current.exists() {
+            ensure_not_symlink(&current)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_not_symlink(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    #[cfg(unix)]
+    if metadata.file_type().is_symlink() || metadata.file_type().is_socket() || metadata.file_type().is_fifo()
+    {
+        bail!("refusing to project through special file {}", path.display());
+    }
+    #[cfg(not(unix))]
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to project through symlink {}", path.display());
+    }
+    Ok(())
+}
+
+fn ensure_projection_target_unchanged(path: &Path, shadow: Option<&Path>) -> Result<()> {
+    match shadow {
+        Some(shadow) => ensure_same_file_identity(path, shadow),
+        None => {
+            if path.exists() {
+                bail!(
+                    "projection target {} appeared during write; refusing to replace it",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn ensure_same_file_identity(path: &Path, shadow: &Path) -> Result<()> {
+    let target = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    let shadow_meta = fs::metadata(shadow)
+        .with_context(|| format!("failed to inspect {}", shadow.display()))?;
+    if target.dev() != shadow_meta.dev() || target.ino() != shadow_meta.ino() {
+        bail!(
+            "projection target {} changed after shadow creation; refusing to replace it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_same_file_identity(path: &Path, shadow: &Path) -> Result<()> {
+    let target = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    let shadow_meta = fs::metadata(shadow)
+        .with_context(|| format!("failed to inspect {}", shadow.display()))?;
+    if target.len() != shadow_meta.len() {
+        bail!(
+            "projection target {} changed after shadow creation; refusing to replace it",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -283,6 +402,7 @@ mod tests {
 
     use super::sync_once;
     use crate::config::ResolvedSyncConfig;
+    use crate::file_state::{FileState, SessionState};
     use crate::git_sync::SyncOptions;
 
     #[test]
@@ -398,6 +518,108 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn refuses_to_project_outside_sessions_root() -> Result<()> {
+        let sandbox = temp_dir("outside-root");
+        let remote = sandbox.join("remote.git");
+        let repo_a = sandbox.join("repo-a");
+        let repo_b = sandbox.join("repo-b");
+        let root_a = sandbox.join("sessions-a");
+        let root_b = sandbox.join("sessions-b");
+        let state_a = sandbox.join("state-a");
+        let state_b = sandbox.join("state-b");
+        let escaped = sandbox.join("escaped.jsonl");
+
+        fs::create_dir_all(&root_a)?;
+        fs::create_dir_all(&root_b)?;
+        git_init_bare(&remote)?;
+        write_session_file(
+            &root_a.join("2026/03/18/session-a.jsonl"),
+            "session-1",
+            &["2026-03-18T21:00:00.000Z"],
+        )?;
+
+        let config_a = sync_config(&repo_a, &remote);
+        let config_b = sync_config(&repo_b, &remote);
+        let options = SyncOptions {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            remote_url: remote.display().to_string(),
+            push: true,
+        };
+
+        sync_once(&root_a, &state_a, &config_a, options.clone())?;
+
+        let state = FileState::new(state_b.clone())?;
+        state.save_session(&SessionState {
+            session_id: "session-1".to_string(),
+            session_hash: sha256_hex("session-1"),
+            local_path: escaped.clone(),
+            last_scan_offset: None,
+            last_scan_anchor_hash: None,
+            last_known_size: None,
+            last_known_mtime_ns: None,
+        })?;
+
+        let error = sync_once(&root_b, &state_b, &config_b, options).expect_err("sync should fail");
+        assert!(error
+            .to_string()
+            .contains("refusing to project outside"));
+        assert!(!escaped.exists());
+
+        fs::remove_dir_all(sandbox)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_overwrite_symlink_target() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = temp_dir("symlink-target");
+        let remote = sandbox.join("remote.git");
+        let repo_a = sandbox.join("repo-a");
+        let repo_b = sandbox.join("repo-b");
+        let root_a = sandbox.join("sessions-a");
+        let root_b = sandbox.join("sessions-b");
+        let state_a = sandbox.join("state-a");
+        let state_b = sandbox.join("state-b");
+        let real_target = sandbox.join("real-target.jsonl");
+
+        fs::create_dir_all(&root_a)?;
+        fs::create_dir_all(root_b.join("2026/03/18"))?;
+        git_init_bare(&remote)?;
+        write_session_file(
+            &root_a.join("2026/03/18/session-a.jsonl"),
+            "session-1",
+            &["2026-03-18T21:00:00.000Z"],
+        )?;
+
+        let config_a = sync_config(&repo_a, &remote);
+        let config_b = sync_config(&repo_b, &remote);
+        let options = SyncOptions {
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            remote_url: remote.display().to_string(),
+            push: true,
+        };
+
+        sync_once(&root_a, &state_a, &config_a, options.clone())?;
+
+        fs::write(&real_target, "do not touch\n")?;
+        let symlink_path = root_b.join(format!("2026/03/18/{}.jsonl", sha256_hex("session-1")));
+        symlink(&real_target, &symlink_path)?;
+
+        let error = sync_once(&root_b, &state_b, &config_b, options).expect_err("sync should fail");
+        assert!(error
+            .to_string()
+            .contains("refusing to project through special file"));
+        assert_eq!(fs::read_to_string(&real_target)?, "do not touch\n");
+
+        fs::remove_dir_all(sandbox)?;
+        Ok(())
+    }
+
     fn sync_config(repo: &Path, remote: &Path) -> ResolvedSyncConfig {
         ResolvedSyncConfig {
             path: repo.join("sync.toml"),
@@ -494,5 +716,13 @@ mod tests {
             .expect("clock before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("codex-session-sync-{label}-{suffix}"))
+    }
+
+    fn sha256_hex(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        hex::encode(hasher.finalize())
     }
 }

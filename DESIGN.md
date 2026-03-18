@@ -194,6 +194,14 @@ The projection file must end with a trailing newline.
 The shadow file is the recovery mechanism for late writes by an uncooperative local Codex process.
 If Codex still holds an open handle to the old inode after projection, those writes land in the old inode, which remains reachable through the shadow path.
 
+Projection safety invariants:
+
+- only project into paths under the configured `~/.codex/sessions` root
+- only project into regular `.jsonl` files
+- never project into a shadow path
+- refuse to project through symlinks or other special filesystem objects
+- after creating a shadow for an existing target, verify that the target path still refers to that same file before atomically replacing it
+
 ## Shadow Retention And Garbage Collection
 
 Shadow files must be collected conservatively.
