@@ -112,16 +112,7 @@ impl RepoSync {
     }
 
     pub fn is_dirty(&self) -> Result<bool> {
-        let output = git(
-            &self.repo,
-            [
-                "status",
-                "--porcelain",
-                "--",
-                ".",
-                ":(exclude).codex-session-sync.lock",
-            ],
-        )?;
+        let output = git(&self.repo, ["status", "--porcelain"])?;
         Ok(!output.stdout.trim().is_empty())
     }
 
@@ -236,16 +227,7 @@ fn detect_remote_branch_state(
 }
 
 fn ensure_clean_worktree(repo: &Path) -> Result<()> {
-    let output = git(
-        repo,
-        [
-            "status",
-            "--porcelain",
-            "--",
-            ".",
-            ":(exclude).codex-session-sync.lock",
-        ],
-    )?;
+    let output = git(repo, ["status", "--porcelain"])?;
     if !output.stdout.trim().is_empty() {
         bail!(
             "sync repo {} has uncommitted changes; refusing to sync into a dirty worktree",
@@ -288,10 +270,7 @@ fn push_with_rebase_retry(repo: &Path, remote: &str, branch: &str) -> Result<()>
 }
 
 fn git_add(repo: &Path, pathspec: &str) -> Result<()> {
-    git(
-        repo,
-        ["add", "--all", "--", pathspec, ":(exclude).codex-session-sync.lock"],
-    )?;
+    git(repo, ["add", "--all", "--", pathspec])?;
     Ok(())
 }
 
@@ -370,7 +349,11 @@ struct RepoLock {
 
 impl RepoLock {
     fn acquire(repo: &Path) -> Result<Option<Self>> {
-        let path = repo.join(".codex-session-sync.lock");
+        let git_dir = repo.join(".git");
+        if !git_dir.is_dir() {
+            bail!("missing .git directory in {}", repo.display());
+        }
+        let path = git_dir.join("codex-session-sync.lock");
         let mut file = File::options()
             .create(true)
             .truncate(false)

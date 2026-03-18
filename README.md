@@ -107,7 +107,7 @@ sessions/<aa>/<bb>/<session_hash>/messages/<YYYYMMDDHH>/<YYYYMMDDHHmmssfff>-<mes
 - Projection of remote sessions back into `~/.codex/sessions`
 - Recovery shadows for late writes to replaced local files
 - File-based local state under the user state directory
-- Local same-checkout sync lock with `.codex-session-sync.lock`
+- Local same-checkout sync lock with `.git/codex-session-sync.lock`
 - Polling daemon loop
 - Tests for multi-clone convergence and shadow-based late-write recovery
 
@@ -228,7 +228,7 @@ If `XDG_STATE_HOME` is not set, this falls back to `~/.local/state`.
 The sync repo itself gets a local coordination lock while a sync is in progress:
 
 ```text
-.codex-session-sync.lock
+.git/codex-session-sync.lock
 ```
 
 This is a persistent lock file. The actual lock is held by the running process through an OS-backed file lock, so stale pathnames by themselves do not block future syncs.
