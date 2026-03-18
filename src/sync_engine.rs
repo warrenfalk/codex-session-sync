@@ -43,8 +43,15 @@ pub fn sync_once(
         let previous_projected_head = state.projected_head()?;
         repo.pull_remote()?;
         repo.ensure_store_readme()?;
+        let head_after_pull = repo.current_head()?;
         let mut sessions_to_project = if previous_projected_head.is_some() {
             repo.changed_session_hashes_since(previous_projected_head.as_deref())?
+        } else if head_after_pull.is_some() {
+            // First projection on a new machine with an already-populated store:
+            // materialize the repository contents that existed before this cycle's uploads.
+            MessageStore::new(repo.repo_path().to_path_buf()).session_hashes()?
+                .into_iter()
+                .collect()
         } else {
             BTreeSet::new()
         };
@@ -67,17 +74,12 @@ pub fn sync_once(
             ensure_live_session_state(&state, file)?;
             let upsert = store.upsert_session_file(&machine_id, file)?;
             summary.messages_written += upsert.messages_written;
-            sessions_to_project.extend(upsert.touched_sessions);
         }
 
         for file in &shadow_report.files {
             let upsert = store.upsert_session_file(&machine_id, file)?;
             summary.messages_written += upsert.messages_written;
             sessions_to_project.extend(upsert.touched_sessions);
-        }
-
-        if previous_projected_head.is_none() {
-            sessions_to_project.extend(store.session_hashes()?);
         }
 
         for session_hash in sessions_to_project {
@@ -519,6 +521,45 @@ mod tests {
     }
 
     #[test]
+    fn initial_sync_to_empty_remote_does_not_project_local_sessions() -> Result<()> {
+        let sandbox = temp_dir("empty-remote-no-project");
+        let remote = sandbox.join("remote.git");
+        let repo = sandbox.join("repo");
+        let root = sandbox.join("sessions");
+        let state = sandbox.join("state");
+
+        fs::create_dir_all(&root)?;
+        git_init_bare(&remote)?;
+        write_session_file(
+            &root.join("2026/03/18/session-a.jsonl"),
+            "session-1",
+            &[
+                "2026-03-18T21:00:00.000Z",
+                "2026-03-18T21:00:01.000Z",
+            ],
+        )?;
+
+        let config = sync_config(&repo, &remote);
+        let summary = sync_once(
+            &root,
+            &state,
+            &config,
+            SyncOptions {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+                remote_url: remote.display().to_string(),
+                push: true,
+            },
+        )?;
+
+        assert_eq!(summary.projected_sessions, 0);
+        assert_eq!(count_shadow_files(&root)?, 0);
+
+        fs::remove_dir_all(sandbox)?;
+        Ok(())
+    }
+
+    #[test]
     fn refuses_to_project_outside_sessions_root() -> Result<()> {
         let sandbox = temp_dir("outside-root");
         let remote = sandbox.join("remote.git");
@@ -708,6 +749,35 @@ mod tests {
             }
         }
         anyhow::bail!("no jsonl file found in {}", root.display())
+    }
+
+    fn count_shadow_files(root: &Path) -> Result<usize> {
+        let mut count = 0usize;
+        for year in fs::read_dir(root)? {
+            let year = year?;
+            if !year.file_type()?.is_dir() {
+                continue;
+            }
+            for month in fs::read_dir(year.path())? {
+                let month = month?;
+                if !month.file_type()?.is_dir() {
+                    continue;
+                }
+                for day in fs::read_dir(month.path())? {
+                    let day = day?;
+                    if !day.file_type()?.is_dir() {
+                        continue;
+                    }
+                    for file in fs::read_dir(day.path())? {
+                        let file = file?;
+                        if crate::session_file::is_shadow_path(&file.path()) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 
     fn temp_dir(label: &str) -> PathBuf {
