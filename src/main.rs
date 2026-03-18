@@ -1,9 +1,10 @@
 mod cli;
 mod config;
+mod file_state;
 mod git_sync;
-mod scan;
-mod spool;
-mod state;
+mod message_store;
+mod session_file;
+mod sync_engine;
 
 use anyhow::Result;
 use clap::Parser;

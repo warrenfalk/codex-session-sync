@@ -15,10 +15,8 @@ let
     cfg.configPath
     "--root"
     cfg.sessionsRoot
-    "--state-db"
-    cfg.stateDb
-    "--spool-dir"
-    cfg.spoolDir
+    "--state-dir"
+    cfg.stateDir
     "--interval-secs"
     (toString cfg.intervalSeconds)
   ] ++ lib.optional (!cfg.push) "--no-push";
@@ -46,16 +44,10 @@ in
       description = "Path to the Codex sessions directory, interpreted by systemd with user specifiers.";
     };
 
-    stateDb = lib.mkOption {
+    stateDir = lib.mkOption {
       type = lib.types.str;
-      default = "%h/.local/state/codex-session-sync/state.sqlite3";
-      description = "Path to the SQLite state database, interpreted by systemd with user specifiers.";
-    };
-
-    spoolDir = lib.mkOption {
-      type = lib.types.str;
-      default = "%h/.local/state/codex-session-sync/spool";
-      description = "Path to the local spool directory, interpreted by systemd with user specifiers.";
+      default = "%h/.local/state/codex-session-sync";
+      description = "Path to the codex-session-sync state directory, interpreted by systemd with user specifiers.";
     };
 
     intervalSeconds = lib.mkOption {
@@ -67,7 +59,7 @@ in
     push = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Whether the daemon should push after committing imported batches.";
+      description = "Whether the daemon should push after committing synced message objects.";
     };
 
     logFilter = lib.mkOption {

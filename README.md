@@ -1,10 +1,10 @@
 # codex-session-sync
 
-`codex-session-sync` is a Rust service for copying local Codex session logs into an append-only Git-backed store.
+`codex-session-sync` is a Rust service for synchronizing Codex session JSONL files across machines through a Git repository.
 
-The local Codex client writes JSONL session files under `~/.codex/sessions`. This project watches those files by scanning them, detects whether each file is new, appended, or rewritten, and writes normalized batch files into a local spool. Those spool batches can then be imported into a separate Git repository that acts as the centralized store.
+The local Codex client writes JSONL session files under `~/.codex/sessions`. This project scans those files, stores individual messages as immutable objects in a separate Git repository, and projects repository contents back into the live local sessions tree. The local session tree remains the user-facing view. The Git repo is the shared message store.
 
-The current implementation is CLI-first. It supports interactive first-time setup, one-shot inspection and ingestion, one-shot sync into a Git repo, and a polling daemon loop.
+The current implementation is CLI-first. It supports interactive first-time setup, one-shot inspection, one-shot sync, and a polling daemon loop.
 
 ## Quick Start
 
@@ -79,36 +79,36 @@ Useful things to check on first run:
 
 - the service stays active instead of exiting immediately
 - `~/.codex/session-sync-repo` (or your configured `repo_path`) gets cloned if it did not already exist
-- `~/.local/state/codex-session-sync/` or `$XDG_STATE_HOME/codex-session-sync/` starts receiving state and spool files
-- the journal shows successful ingest and sync cycles
+- `~/.local/state/codex-session-sync/` or `$XDG_STATE_HOME/codex-session-sync/` starts receiving state files
+- the journal shows successful sync cycles
 
 ## Design
 
-The sync flow has four stages:
+The detailed design is in [DESIGN.md](/Users/warren/source/codex-session-sync/DESIGN.md).
 
-1. Scan local Codex session files under `~/.codex/sessions`.
-2. Compare each file to prior state stored in SQLite.
-3. Write new or changed records into an append-only local spool.
-4. Import spool batches into a separate Git repo as immutable files, then commit and optionally push.
+At a high level:
 
-The central repo layout is intentionally append-only:
+1. Scan local live session files under `~/.codex/sessions`.
+2. Store each JSONL message as an immutable object in the sync repo.
+3. Pull remote changes and push local changes through Git.
+4. Reproject repository messages back into local session files.
+
+The repository is sharded by session hash and stores message objects named by sortable UTC timestamp plus message hash:
 
 ```text
-sessions/<session-id>/batches/<batch-id>.json
+sessions/<aa>/<bb>/<session_hash>/messages/<YYYYMMDDHHmmssfff>-<message_hash>.json
 ```
-
-This avoids mutable per-session files and makes concurrent multi-clone sync much easier to merge.
 
 ## Current Features
 
 - JSONL session scanning and parsing
-- Append vs rewrite detection
-- SQLite-backed local file state
-- Append-only local spool
-- Git-backed batch import
+- Git-backed message object store
+- Projection of remote sessions back into `~/.codex/sessions`
+- Recovery shadows for late writes to replaced local files
+- File-based local state under the user state directory
 - Local same-checkout sync lock with `.codex-session-sync.lock`
 - Polling daemon loop
-- Tests for append detection, rewrite detection, local lock behavior, and multi-clone Git convergence
+- Tests for multi-clone convergence and shadow-based late-write recovery
 
 ## Development Setup
 
@@ -124,7 +124,6 @@ The shell provides:
 - `cargo-nextest`
 - `git`
 - `pkg-config`
-- `sqlite`
 
 The shell also keeps Cargo and Rustup state inside the repo:
 
@@ -144,70 +143,40 @@ cargo test
 
 ### Inspect
 
-Inspect the current local Codex session tree without changing state:
+Inspect the current local session tree:
 
 ```bash
 cargo run -- inspect --limit 20
 ```
 
-Inspect and update the local SQLite state snapshot:
-
-```bash
-cargo run -- inspect --write-state
-```
-
-### Ingest Once
-
-Scan local sessions, detect changes, and write batches into the local spool:
-
-```bash
-cargo run -- ingest-once
-```
-
-By default this uses:
-
-- session root: `~/.codex/sessions`
-- state DB: `$XDG_STATE_HOME/codex-session-sync/state.sqlite3`
-- spool dir: `$XDG_STATE_HOME/codex-session-sync/spool`
-
-If `XDG_STATE_HOME` is not set, the fallback is:
-
-- `~/.local/state/codex-session-sync/state.sqlite3`
-- `~/.local/state/codex-session-sync/spool`
+This reports live session files, shadow recovery files, and scan warnings.
 
 ### Sync Once
 
-Import pending spool batches into the configured Git repo and commit them there:
+Run one full sync cycle:
 
 ```bash
 cargo run -- sync-repo
 ```
 
-You can still override the configured repo path explicitly:
+This does all of the following:
+
+1. pull the sync repo
+2. scan live local session files
+3. recover messages from shadow files
+4. write missing message objects into the repo clone
+5. commit and optionally push
+6. reproject repository contents back into the local session tree
+
+Useful flags:
 
 ```bash
+cargo run -- sync-repo --state-dir ~/.local/state/codex-session-sync
 cargo run -- sync-repo --repo /path/to/central-repo
-```
-
-If you want to skip pushing and only create a local commit in the target repo:
-
-```bash
 cargo run -- sync-repo --no-push
 ```
 
-`--no-push` still pulls remote changes into the local clone. It only disables the final push step.
-
-If the configured local repo path does not exist yet, the tool will clone `remote_url` into it automatically.
-
-If the repo has an `origin` remote and you do not pass `--no-push`, the tool will:
-
-1. `pull --rebase`
-2. import immutable batch files
-3. commit
-4. push
-5. retry with rebase if the push races with another clone
-
-Even if there are no local pending batches, the sync step still refreshes the local repo from the remote so this machine can see sessions uploaded elsewhere.
+`--no-push` still pulls remote changes and still reprojects the local session tree. It only disables the final push step.
 
 ### Daemon
 
@@ -249,9 +218,9 @@ This prompt currently asks for the remote repository URL and preserves the exist
 
 Runtime state lives under the user state directory:
 
-- `$XDG_STATE_HOME/codex-session-sync/state.sqlite3`
-- `$XDG_STATE_HOME/codex-session-sync/spool/pending/`
-- `$XDG_STATE_HOME/codex-session-sync/spool/processed/`
+- `$XDG_STATE_HOME/codex-session-sync/machine-id`
+- `$XDG_STATE_HOME/codex-session-sync/last-projected-head`
+- `$XDG_STATE_HOME/codex-session-sync/sessions/<aa>/<bb>/<session_hash>.toml`
 
 If `XDG_STATE_HOME` is not set, this falls back to `~/.local/state`.
 
@@ -262,6 +231,8 @@ The sync repo itself gets a local coordination lock while a sync is in progress:
 ```
 
 If another process is already syncing the same checkout, the second process skips that sync cycle and retries later.
+
+Projection may also create hidden shadow files next to live session files. Those are recovery artifacts for late writes against replaced inodes.
 
 ## Recommended Usage
 
@@ -275,7 +246,7 @@ A typical flow is:
 4. Run the daemon.
 5. Let other machines run the same daemon with their own `~/.codex/sync.toml`.
 
-Because the imported files are immutable batch files, concurrent clones mostly add different files instead of editing the same file.
+Because the imported files are immutable message objects, concurrent clones mostly add different files instead of editing the same file.
 
 ## NixOS User Service
 
@@ -312,15 +283,14 @@ Important notes:
 - The user service is installed for all users.
 - A user who does not have `~/.codex/sync.toml` will simply no-op and exit successfully.
 - A user who does have `~/.codex/sync.toml` can be bootstrapped automatically because the local repo clone is created from `remote_url` if missing.
-- The module passes explicit user-local paths for the config file, session root, state DB, and spool directory.
+- The module passes explicit user-local paths for the config file, session root, and state directory.
 - The package output wraps `git`, so the service does not depend on an external `git` being present in the user shell.
 
 ## Status
 
-This is an early implementation, but the core sync model is already exercised by tests:
+This is still evolving, but the core message-object sync path is now exercised by tests:
 
 - same-checkout coordination via a local lock
-- local append and rewrite detection
-- concurrent multi-clone convergence against a shared bare remote
-
-The biggest remaining work is operational polish rather than basic protocol shape.
+- empty-remote bootstrap
+- remote projection into a second machine's live sessions tree
+- recovery of late writes through retained shadow files

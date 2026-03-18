@@ -28,7 +28,6 @@
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
           nativeCheckInputs = [ pkgs.git ];
-          buildInputs = [ pkgs.sqlite ];
           postFixup = ''
             wrapProgram "$out/bin/codex-session-sync" \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
@@ -50,7 +49,6 @@
             cargo-nextest
             git
             pkg-config
-            sqlite
           ];
 
           shellHook = ''
