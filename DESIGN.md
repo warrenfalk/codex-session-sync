@@ -194,6 +194,40 @@ The projection file must end with a trailing newline.
 The shadow file is the recovery mechanism for late writes by an uncooperative local Codex process.
 If Codex still holds an open handle to the old inode after projection, those writes land in the old inode, which remains reachable through the shadow path.
 
+## Shadow Retention And Garbage Collection
+
+Shadow files must be collected conservatively.
+
+The system should not delete a shadow immediately after scanning it once, because a local Codex process may still hold an open handle to the old inode and continue writing to it after projection.
+
+The intended garbage-collection policy is:
+
+1. A shadow only becomes a collection candidate after a successful sync cycle has:
+   - scanned the shadow
+   - uploaded any missing messages recoverable from it into the repository
+   - reprojected the affected session
+2. The shadow must then remain unchanged for at least one later successful sync cycle.
+   Unchanged means:
+   - same size
+   - same modification time
+   - ideally the same content hash
+3. The shadow must also be older than the grace period.
+
+The default grace period should be one week.
+
+That default is intentionally long because leaving a Codex CLI session open for days is realistic, and the old process may continue writing through an inherited file descriptor long after projection replaced the path.
+
+The system should therefore treat a shadow as free to collect only when it is:
+
+- fully reconciled into the repository
+- unchanged on a later successful sync cycle
+- older than one week
+
+The implementation should not rely on detecting whether another process still has the old inode open.
+Portable, reliable open-handle detection is not available in the general case, and OS-specific checks such as `lsof` would still be race-prone.
+
+The design therefore prefers time-based and stability-based retention over handle inspection.
+
 ## Feedback Loop Avoidance
 
 Feedback loop avoidance does not rely on hiding projected files from the scanner.
